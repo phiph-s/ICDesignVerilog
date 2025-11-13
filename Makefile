@@ -17,5 +17,10 @@ sim_spi:
 	iverilog -g2012 -o sim_spi.out rtl/spi_master.sv tb/tb_spi_master.sv tb/spi_slave_dummy.v
 	vvp sim_spi.out
 
+# SPI-only sim
+sim_at25010:
+	iverilog -g2012 -o sim_at25010.out rtl/at25010_if.sv tb/tb_at25010_if.v rtl/spi_master.v
+	vvp sim_at25010.out
+
 clean:
 	rm -f sim.out wave.vcd

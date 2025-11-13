@@ -1,99 +1,145 @@
 module at25010_if (
-    input  logic clk,
-    input  logic rst_n,
+    input  logic       clk,
+    input  logic       rst_n,
 
-    // Request to read 1 byte key
-    input  logic        req_read,
-    input  logic [7:0]  addr,
-    output logic [7:0]  data,
-    output logic        data_valid,
-    output logic        busy,
+    // User request
+    input  logic       req_read,
+    input  logic [7:0] addr,
+    output logic [7:0] data,
+    output logic       data_valid,   // 1 Takt lang, wenn data gültig
+    output logic       busy,         // Modul beschäftigt
 
-    // SPI
+    // SPI pins
     output logic sck,
     output logic mosi,
     input  logic miso,
     output logic cs_n
 );
 
-    typedef enum logic [2:0] {
-        S_IDLE,
-        S_CMD,     // send READ command
-        S_ADDR,    // send address byte
-        S_DATA,    // receive data byte
-        S_DONE
-    } state_t;
+    // ------------------------------------------------------------
+    // Verbindung zum SPI-Master
+    // ------------------------------------------------------------
+    logic       spi_start;
+    logic       spi_last_byte;
+    logic [7:0] spi_tx_data;
+    logic [7:0] spi_rx_data;
+    logic       spi_busy;
+    logic       spi_done;
 
-    state_t state, next;
+    spi_master #(
+        .CLK_DIV(4)
+    ) spi_inst (
+        .clk      (clk),
+        .rst_n    (rst_n),
 
-    logic spi_start, spi_done, last_byte;
-    logic [7:0] tx, rx;
+        .start    (spi_start),
+        .last_byte(spi_last_byte),
+        .tx_data  (spi_tx_data),
+        .rx_data  (spi_rx_data),
 
-    spi_master spi (
-        .clk(clk),
-        .rst_n(rst_n),
-        .start(spi_start),
-        .tx_data(tx),
-        .rx_data(rx),
-        .last_byte(last_byte),
-        .busy(),
-        .done(spi_done),
-        .sck(sck),
-        .mosi(mosi),
-        .miso(miso),
-        .cs_n(cs_n)
+        .busy     (spi_busy),
+        .done     (spi_done),
+
+        .sck      (sck),
+        .mosi     (mosi),
+        .miso     (miso),
+        .cs_n     (cs_n)
     );
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            state <= S_IDLE;
-        else
-            state <= next;
-    end
+    // ------------------------------------------------------------
+    // FSM: READ-Sequenz: 0x03 → addr → dummy
+    // ------------------------------------------------------------
+    typedef enum logic [2:0] {
+        S_IDLE,
+        S_CMD_START,
+        S_CMD_WAIT,
+        S_ADDR_START,
+        S_ADDR_WAIT,
+        S_DATA_START,
+        S_DATA_WAIT
+    } state_t;
+
+    state_t state;
 
     assign busy = (state != S_IDLE);
-    assign data_valid = (state == S_DONE);
 
-    always_comb begin
-        spi_start = 0;
-        last_byte = 0;
-        tx = 8'h00;
+    // FSM + Steuersignale
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state       <= S_IDLE;
+            spi_start   <= 1'b0;
+            spi_last_byte <= 1'b0;
+            spi_tx_data <= 8'h00;
+            data        <= 8'h00;
+            data_valid  <= 1'b0;
+        end else begin
+            // Defaults pro Takt
+            spi_start   <= 1'b0;
+            data_valid  <= 1'b0;
 
-        next = state;
+            case (state)
 
-        case (state)
-            S_IDLE:
-                if (req_read)
-                    next = S_CMD;
-
-            S_CMD: begin
-                spi_start = 1;
-                tx = 8'h03;      // READ opcode
-                next = S_ADDR;
-            end
-
-            S_ADDR: begin
-                if (spi_done) begin
-                    spi_start = 1;
-                    tx = addr;
-                    next = S_DATA;
+                // ------------------------------------------------
+                S_IDLE: begin
+                    if (req_read) begin
+                        state <= S_CMD_START;
+                    end
                 end
-            end
 
-            S_DATA: begin
-                if (spi_done) begin
-                    spi_start = 1;
-                    tx = 8'h00;         // dummy byte
-                    last_byte = 1;
-                    next = S_DONE;
+                // ------------------------------------------------
+                // 1) READ-Opcode senden (0x03)
+                // ------------------------------------------------
+                S_CMD_START: begin
+                    spi_tx_data   <= 8'h03;   // READ opcode
+                    spi_last_byte <= 1'b0;   // weitere Bytes folgen
+                    spi_start     <= 1'b1;   // 1-Takt-Startpuls
+                    state         <= S_CMD_WAIT;
                 end
-            end
 
-            S_DONE:
-                next = S_IDLE;
-        endcase
+                S_CMD_WAIT: begin
+                    if (spi_done) begin
+                        state <= S_ADDR_START;
+                    end
+                end
+
+                // ------------------------------------------------
+                // 2) Adresse senden
+                // ------------------------------------------------
+                S_ADDR_START: begin
+                    spi_tx_data   <= addr;
+                    spi_last_byte <= 1'b0;   // noch nicht letztes Byte
+                    spi_start     <= 1'b1;
+                    state         <= S_ADDR_WAIT;
+                end
+
+                S_ADDR_WAIT: begin
+                    if (spi_done) begin
+                        state <= S_DATA_START;
+                    end
+                end
+
+                // ------------------------------------------------
+                // 3) Dummy-Byte senden, dabei Daten empfangen
+                // ------------------------------------------------
+                S_DATA_START: begin
+                    spi_tx_data   <= 8'h00;  // Dummy
+                    spi_last_byte <= 1'b1;   // letztes Byte der Transaktion
+                    spi_start     <= 1'b1;
+                    state         <= S_DATA_WAIT;
+                end
+
+                S_DATA_WAIT: begin
+                    if (spi_done) begin
+                        data       <= spi_rx_data;
+                        data_valid <= 1'b1;   // ein Takt gültig
+                        state      <= S_IDLE;
+                    end
+                end
+
+                default: state <= S_IDLE;
+
+            endcase
+        end
     end
-
-    assign data = rx;
 
 endmodule
