@@ -22,5 +22,10 @@ sim_at25010:
 	iverilog -g2012 -o sim_at25010.out rtl/spi_master.v rtl/at25010_interface.v tb/tb_at25010_interface.v
 	vvp sim_at25010.out
 
+# MFRC522 Interface sim
+sim_mfrc522:
+	iverilog -g2012 -o sim_mfrc522.out rtl/spi_master.v rtl/mfrc522_interface.v tb/tb_mfrc522_interface.v
+	vvp sim_mfrc522.out
+
 clean:
 	rm -f *.out *.vcd
