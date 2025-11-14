@@ -37,7 +37,9 @@ module tb_mfrc522_interface;
     
     // DUT instantiation
     mfrc522_interface #(
-        .CLOCK_DIV(4)
+        .CLKS_PER_HALF_BIT(2),
+        .MAX_BYTES_PER_CS(2),
+        .CS_INACTIVE_CLKS(10)
     ) dut (
         .clk(clk),
         .rst_n(rst_n),

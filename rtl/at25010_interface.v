@@ -3,7 +3,9 @@
 // Supports standard AT25010 command set
 
 module at25010_interface #(
-    parameter CLOCK_DIV = 4  // SPI clock divider
+    parameter CLKS_PER_HALF_BIT = 2,  // SPI clock divider
+    parameter MAX_BYTES_PER_CS = 3,   // Max bytes per transaction
+    parameter CS_INACTIVE_CLKS = 10   // CS inactive clocks
 )(
     input wire clk,
     input wire rst_n,
@@ -42,51 +44,51 @@ module at25010_interface #(
     localparam OP_WRITE = 8'h02;
     
     // State machine
-    localparam ST_IDLE      = 4'b0000;
-    localparam ST_CS_SETUP  = 4'b0001;
-    localparam ST_SEND_CMD  = 4'b0010;
-    localparam ST_SEND_ADDR = 4'b0011;
-    localparam ST_SEND_DATA = 4'b0100;
-    localparam ST_RECV_DATA = 4'b0101;
-    localparam ST_CS_HOLD   = 4'b0110;
-    localparam ST_DONE      = 4'b0111;
-    localparam ST_ERROR     = 4'b1000;
+    localparam ST_IDLE         = 3'd0;
+    localparam ST_START_XFER   = 3'd1;
+    localparam ST_SEND_BYTES   = 3'd2;
+    localparam ST_WAIT_DONE    = 3'd3;
+    localparam ST_WRITE_DELAY  = 3'd4;
+    localparam ST_DONE         = 3'd5;
+    localparam ST_ERROR        = 3'd6;
     
-    reg [3:0] state;
+    reg [2:0] state;
     reg [2:0] current_cmd;
     reg [6:0] current_addr;
     reg [7:0] current_wdata;
+    reg [15:0] write_delay_counter;  // Write cycle delay
+    reg [1:0] byte_count;            // Bytes to send counter
+    reg [1:0] bytes_sent;            // Bytes sent counter
     
     // SPI Master signals
-    reg spi_start;
-    reg [7:0] spi_tx_data;
-    wire [7:0] spi_rx_data;
-    wire spi_busy;
-    wire spi_done;
+    reg [1:0] spi_tx_count;
+    reg [7:0] spi_tx_byte;
+    reg spi_tx_dv;
+    wire spi_tx_ready;
+    wire [7:0] spi_rx_byte;
+    wire [1:0] spi_rx_count;
+    wire spi_rx_dv;
     
-    // Chip select control
-    reg cs_active;
-    assign spi_cs_n = ~cs_active;
-    
-    // Timing counter for CS setup/hold
-    reg [3:0] timing_counter;
-    
-    // SPI Master instance (Mode 0: CPOL=0, CPHA=0)
-    spi_master #(
-        .CLOCK_DIV(CLOCK_DIV)
+    // SPI Master instance from ip/spi-master (Mode 0: CPOL=0, CPHA=0)
+    SPI_Master_With_Single_CS #(
+        .SPI_MODE(0),
+        .CLKS_PER_HALF_BIT(CLKS_PER_HALF_BIT),
+        .MAX_BYTES_PER_CS(MAX_BYTES_PER_CS),
+        .CS_INACTIVE_CLKS(CS_INACTIVE_CLKS)
     ) spi_inst (
-        .clk(clk),
-        .rst_n(rst_n),
-        .start(spi_start),
-        .tx_data(spi_tx_data),
-        .rx_data(spi_rx_data),
-        .busy(spi_busy),
-        .done(spi_done),
-        .cpol(1'b0),           // Mode 0
-        .cpha(1'b0),
-        .spi_sclk(spi_sclk),
-        .spi_mosi(spi_mosi),
-        .spi_miso(spi_miso)
+        .i_Rst_L(rst_n),
+        .i_Clk(clk),
+        .i_TX_Count(spi_tx_count),
+        .i_TX_Byte(spi_tx_byte),
+        .i_TX_DV(spi_tx_dv),
+        .o_TX_Ready(spi_tx_ready),
+        .o_RX_Count(spi_rx_count),
+        .o_RX_DV(spi_rx_dv),
+        .o_RX_Byte(spi_rx_byte),
+        .o_SPI_Clk(spi_sclk),
+        .i_SPI_MISO(spi_miso),
+        .o_SPI_MOSI(spi_mosi),
+        .o_SPI_CS_n(spi_cs_n)
     );
     
     // Main state machine
@@ -97,136 +99,140 @@ module at25010_interface #(
             cmd_done <= 0;
             cmd_error <= 0;
             cmd_rdata <= 0;
-            cs_active <= 0;
-            spi_start <= 0;
-            spi_tx_data <= 0;
+            spi_tx_dv <= 0;
+            spi_tx_byte <= 0;
+            spi_tx_count <= 0;
             current_cmd <= 0;
             current_addr <= 0;
             current_wdata <= 0;
-            timing_counter <= 0;
+            byte_count <= 0;
+            bytes_sent <= 0;
+            write_delay_counter <= 0;
         end else begin
             // Default: clear pulses
             cmd_done <= 0;
-            spi_start <= 0;
+            spi_tx_dv <= 0;
             
             case (state)
                 ST_IDLE: begin
                     cmd_ready <= 1;
-                    cs_active <= 0;
                     
                     if (cmd_valid && cmd_ready) begin
                         cmd_ready <= 0;
                         current_cmd <= cmd_type;
                         current_addr <= cmd_addr;
                         current_wdata <= cmd_wdata;
-                        timing_counter <= 0;
-                        state <= ST_CS_SETUP;
-                    end
-                end
-                
-                ST_CS_SETUP: begin
-                    // CS setup time (2 cycles minimum)
-                    if (timing_counter == 0) begin
-                        cs_active <= 1;
-                        timing_counter <= timing_counter + 1;
-                    end else if (timing_counter >= 2) begin
-                        timing_counter <= 0;
-                        state <= ST_SEND_CMD;
+                        bytes_sent <= 0;
                         
-                        // Load opcode based on command
-                        case (current_cmd)
-                            CMD_WREN:  spi_tx_data <= OP_WREN;
-                            CMD_WRDI:  spi_tx_data <= OP_WRDI;
-                            CMD_RDSR:  spi_tx_data <= OP_RDSR;
-                            CMD_WRSR:  spi_tx_data <= OP_WRSR;
-                            CMD_READ:  spi_tx_data <= OP_READ;
-                            CMD_WRITE: spi_tx_data <= OP_WRITE;
-                            default:   spi_tx_data <= 8'h00;
+                        // Determine byte count for transaction
+                        case (cmd_type)
+                            CMD_WREN, CMD_WRDI: byte_count <= 2'd1;  // 1 byte: opcode
+                            CMD_RDSR, CMD_WRSR: byte_count <= 2'd2;  // 2 bytes: opcode + data
+                            CMD_READ, CMD_WRITE: byte_count <= 2'd3; // 3 bytes: opcode + addr + data
+                            default: byte_count <= 2'd1;
                         endcase
-                        spi_start <= 1;
-                    end else begin
-                        timing_counter <= timing_counter + 1;
+                        
+                        state <= ST_START_XFER;
                     end
                 end
                 
-                ST_SEND_CMD: begin
-                    if (spi_done) begin
-                        // Check if command needs address
+                ST_START_XFER: begin
+                    // Start SPI transaction with byte count
+                    spi_tx_count <= byte_count;
+                    
+                    // Load first byte (opcode)
+                    case (current_cmd)
+                        CMD_WREN:  spi_tx_byte <= OP_WREN;
+                        CMD_WRDI:  spi_tx_byte <= OP_WRDI;
+                        CMD_RDSR:  spi_tx_byte <= OP_RDSR;
+                        CMD_WRSR:  spi_tx_byte <= OP_WRSR;
+                        CMD_READ:  spi_tx_byte <= OP_READ;
+                        CMD_WRITE: spi_tx_byte <= OP_WRITE;
+                        default:   spi_tx_byte <= 8'h00;
+                    endcase
+                    
+                    spi_tx_dv <= 1;
+                    bytes_sent <= 1;
+                    state <= ST_SEND_BYTES;
+                end
+                
+                ST_SEND_BYTES: begin
+                    // Send remaining bytes when SPI is ready
+                    if (spi_tx_ready && bytes_sent < byte_count) begin
+                        bytes_sent <= bytes_sent + 1;
+                        
+                        // Determine what to send based on byte position
+                        if (bytes_sent == 1) begin
+                            // Second byte
+                            case (current_cmd)
+                                CMD_READ, CMD_WRITE: begin
+                                    spi_tx_byte <= {1'b0, current_addr};
+                                end
+                                CMD_WRSR: begin
+                                    spi_tx_byte <= current_wdata;
+                                end
+                                CMD_RDSR: begin
+                                    spi_tx_byte <= 8'h00;  // Dummy
+                                end
+                                default: spi_tx_byte <= 8'h00;
+                            endcase
+                        end else if (bytes_sent == 2) begin
+                            // Third byte
+                            case (current_cmd)
+                                CMD_WRITE: begin
+                                    spi_tx_byte <= current_wdata;
+                                end
+                                CMD_READ: begin
+                                    spi_tx_byte <= 8'h00;  // Dummy
+                                end
+                                default: spi_tx_byte <= 8'h00;
+                            endcase
+                        end else begin
+                            spi_tx_byte <= 8'h00;
+                        end
+                        
+                        spi_tx_dv <= 1;
+                    end else if (bytes_sent >= byte_count) begin
+                        state <= ST_WAIT_DONE;
+                    end
+                end
+                
+                ST_WAIT_DONE: begin
+                    // Wait for all bytes to complete and capture read data
+                    if (spi_rx_dv) begin
+                        // Capture read data from appropriate byte (RX count lags by 1)
                         case (current_cmd)
-                            CMD_READ, CMD_WRITE: begin
-                                // Send address byte
-                                spi_tx_data <= {1'b0, current_addr};
-                                spi_start <= 1;
-                                state <= ST_SEND_ADDR;
-                            end
-                            
-                            CMD_WRSR: begin
-                                // Send data byte for write status
-                                spi_tx_data <= current_wdata;
-                                spi_start <= 1;
-                                state <= ST_SEND_DATA;
-                            end
-                            
                             CMD_RDSR: begin
-                                // Receive status byte
-                                spi_tx_data <= 8'h00;  // Dummy data
-                                spi_start <= 1;
-                                state <= ST_RECV_DATA;
+                                if (spi_rx_count == 2'd1) begin  // Second byte
+                                    cmd_rdata <= spi_rx_byte;
+                                end
                             end
-                            
-                            default: begin
-                                // Commands without data (WREN, WRDI)
-                                state <= ST_CS_HOLD;
-                            end
-                        endcase
-                    end
-                end
-                
-                ST_SEND_ADDR: begin
-                    if (spi_done) begin
-                        case (current_cmd)
-                            CMD_WRITE: begin
-                                // Send write data
-                                spi_tx_data <= current_wdata;
-                                spi_start <= 1;
-                                state <= ST_SEND_DATA;
-                            end
-                            
                             CMD_READ: begin
-                                // Receive read data
-                                spi_tx_data <= 8'h00;  // Dummy data
-                                spi_start <= 1;
-                                state <= ST_RECV_DATA;
-                            end
-                            
-                            default: begin
-                                state <= ST_ERROR;
+                                if (spi_rx_count == 2'd2) begin  // Third byte
+                                    cmd_rdata <= spi_rx_byte;
+                                end
                             end
                         endcase
                     end
-                end
-                
-                ST_SEND_DATA: begin
-                    if (spi_done) begin
-                        state <= ST_CS_HOLD;
+                    
+                    // When TX is ready again, transaction is complete
+                    if (spi_tx_ready && !spi_tx_dv) begin
+                        // Check if write operation needs delay
+                        if (current_cmd == CMD_WRITE || current_cmd == CMD_WRSR) begin
+                            write_delay_counter <= 16'd250;
+                            state <= ST_WRITE_DELAY;
+                        end else begin
+                            state <= ST_DONE;
+                        end
                     end
                 end
                 
-                ST_RECV_DATA: begin
-                    if (spi_done) begin
-                        cmd_rdata <= spi_rx_data;
-                        state <= ST_CS_HOLD;
-                    end
-                end
-                
-                ST_CS_HOLD: begin
-                    // CS hold time (2 cycles minimum)
-                    if (timing_counter >= 2) begin
-                        cs_active <= 0;
-                        timing_counter <= 0;
+                ST_WRITE_DELAY: begin
+                    // Wait for self-timed write cycle to complete
+                    if (write_delay_counter == 0) begin
                         state <= ST_DONE;
                     end else begin
-                        timing_counter <= timing_counter + 1;
+                        write_delay_counter <= write_delay_counter - 1;
                     end
                 end
                 
@@ -237,7 +243,6 @@ module at25010_interface #(
                 
                 ST_ERROR: begin
                     cmd_error <= 1;
-                    cs_active <= 0;
                     state <= ST_IDLE;
                 end
                 

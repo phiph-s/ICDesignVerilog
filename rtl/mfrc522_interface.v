@@ -3,7 +3,9 @@
 // SPI Mode 0 (CPOL=0, CPHA=0)
 
 module mfrc522_interface #(
-    parameter CLOCK_DIV = 4  // SPI clock divider
+    parameter CLKS_PER_HALF_BIT = 2,  // SPI clock divider
+    parameter MAX_BYTES_PER_CS = 2,   // Max bytes per transaction
+    parameter CS_INACTIVE_CLKS = 10   // CS inactive clocks
 )(
     input wire clk,
     input wire rst_n,
@@ -32,49 +34,46 @@ module mfrc522_interface #(
     // Byte 1: Data byte (write) or dummy+data (read)
     
     // State machine
-    localparam ST_IDLE      = 3'b000;
-    localparam ST_CS_SETUP  = 3'b001;
-    localparam ST_SEND_ADDR = 3'b010;
-    localparam ST_SEND_DATA = 3'b011;
-    localparam ST_RECV_DATA = 3'b100;
-    localparam ST_CS_HOLD   = 3'b101;
-    localparam ST_DONE      = 3'b110;
+    localparam ST_IDLE        = 2'b00;
+    localparam ST_START_XFER  = 2'b01;
+    localparam ST_SEND_DATA   = 2'b10;
+    localparam ST_DONE        = 2'b11;
     
-    reg [2:0] state;
+    reg [1:0] state;
     reg current_is_write;
     reg [5:0] current_addr;
     reg [7:0] current_wdata;
+    reg bytes_sent;
     
     // SPI Master signals
-    reg spi_start;
-    reg [7:0] spi_tx_data;
-    wire [7:0] spi_rx_data;
-    wire spi_busy;
-    wire spi_done;
+    reg [1:0] spi_tx_count;
+    reg [7:0] spi_tx_byte;
+    reg spi_tx_dv;
+    wire spi_tx_ready;
+    wire [7:0] spi_rx_byte;
+    wire [1:0] spi_rx_count;
+    wire spi_rx_dv;
     
-    // Chip select control
-    reg cs_active;
-    assign spi_cs_n = ~cs_active;
-    
-    // Timing counter for CS setup/hold
-    reg [3:0] timing_counter;
-    
-    // SPI Master instance
-    spi_master #(
-        .CLOCK_DIV(CLOCK_DIV)
+    // SPI Master instance from ip/spi-master
+    SPI_Master_With_Single_CS #(
+        .SPI_MODE(0),
+        .CLKS_PER_HALF_BIT(CLKS_PER_HALF_BIT),
+        .MAX_BYTES_PER_CS(MAX_BYTES_PER_CS),
+        .CS_INACTIVE_CLKS(CS_INACTIVE_CLKS)
     ) spi_inst (
-        .clk(clk),
-        .rst_n(rst_n),
-        .start(spi_start),
-        .tx_data(spi_tx_data),
-        .rx_data(spi_rx_data),
-        .busy(spi_busy),
-        .done(spi_done),
-        .cpol(1'b0),           // Mode 0
-        .cpha(1'b0),
-        .spi_sclk(spi_sclk),
-        .spi_mosi(spi_mosi),
-        .spi_miso(spi_miso)
+        .i_Rst_L(rst_n),
+        .i_Clk(clk),
+        .i_TX_Count(spi_tx_count),
+        .i_TX_Byte(spi_tx_byte),
+        .i_TX_DV(spi_tx_dv),
+        .o_TX_Ready(spi_tx_ready),
+        .o_RX_Count(spi_rx_count),
+        .o_RX_DV(spi_rx_dv),
+        .o_RX_Byte(spi_rx_byte),
+        .o_SPI_Clk(spi_sclk),
+        .i_SPI_MISO(spi_miso),
+        .o_SPI_MOSI(spi_mosi),
+        .o_SPI_CS_n(spi_cs_n)
     );
     
     // Main state machine
@@ -84,87 +83,64 @@ module mfrc522_interface #(
             cmd_ready <= 1;
             cmd_done <= 0;
             cmd_rdata <= 0;
-            cs_active <= 0;
-            spi_start <= 0;
-            spi_tx_data <= 0;
+            spi_tx_dv <= 0;
+            spi_tx_byte <= 0;
+            spi_tx_count <= 0;
             current_is_write <= 0;
             current_addr <= 0;
             current_wdata <= 0;
-            timing_counter <= 0;
+            bytes_sent <= 0;
         end else begin
             // Default: clear pulses
             cmd_done <= 0;
-            spi_start <= 0;
+            spi_tx_dv <= 0;
             
             case (state)
                 ST_IDLE: begin
                     cmd_ready <= 1;
-                    cs_active <= 0;
                     
                     if (cmd_valid && cmd_ready) begin
                         cmd_ready <= 0;
                         current_is_write <= cmd_is_write;
                         current_addr <= cmd_addr;
                         current_wdata <= cmd_wdata;
-                        timing_counter <= 0;
-                        state <= ST_CS_SETUP;
+                        bytes_sent <= 0;
+                        state <= ST_START_XFER;
                     end
                 end
                 
-                ST_CS_SETUP: begin
-                    // CS setup time (2 cycles minimum)
-                    if (timing_counter == 0) begin
-                        cs_active <= 1;
-                        timing_counter <= timing_counter + 1;
-                    end else if (timing_counter >= 2) begin
-                        timing_counter <= 0;
-                        state <= ST_SEND_ADDR;
-                        
-                        // Build address byte: [R/W][A5:A0][0]
-                        spi_tx_data <= {current_is_write, current_addr, 1'b0};
-                        spi_start <= 1;
-                    end else begin
-                        timing_counter <= timing_counter + 1;
-                    end
-                end
-                
-                ST_SEND_ADDR: begin
-                    if (spi_done) begin
-                        if (current_is_write) begin
-                            // Send write data
-                            spi_tx_data <= current_wdata;
-                            spi_start <= 1;
-                            state <= ST_SEND_DATA;
-                        end else begin
-                            // Receive read data (send dummy byte)
-                            spi_tx_data <= 8'h00;
-                            spi_start <= 1;
-                            state <= ST_RECV_DATA;
-                        end
-                    end
+                ST_START_XFER: begin
+                    // Start 2-byte transaction
+                    spi_tx_count <= 2'd2;
+                    
+                    // Build and send address byte: [R/W][A5:A0][0]
+                    spi_tx_byte <= {current_is_write, current_addr, 1'b0};
+                    spi_tx_dv <= 1;
+                    bytes_sent <= 0;
+                    state <= ST_SEND_DATA;
                 end
                 
                 ST_SEND_DATA: begin
-                    if (spi_done) begin
-                        state <= ST_CS_HOLD;
+                    // Wait for SPI master to be ready after first byte
+                    if (spi_tx_ready && !spi_tx_dv) begin
+                        if (bytes_sent == 0) begin
+                            // Send second byte
+                            bytes_sent <= 1;
+                            if (current_is_write) begin
+                                spi_tx_byte <= current_wdata;
+                            end else begin
+                                spi_tx_byte <= 8'h00;  // Dummy for read
+                            end
+                            spi_tx_dv <= 1;
+                        end else begin
+                            // All bytes sent, wait for completion
+                            state <= ST_DONE;
+                        end
                     end
-                end
-                
-                ST_RECV_DATA: begin
-                    if (spi_done) begin
-                        cmd_rdata <= spi_rx_data;
-                        state <= ST_CS_HOLD;
-                    end
-                end
-                
-                ST_CS_HOLD: begin
-                    // CS hold time (2 cycles minimum)
-                    if (timing_counter >= 2) begin
-                        cs_active <= 0;
-                        timing_counter <= 0;
-                        state <= ST_DONE;
-                    end else begin
-                        timing_counter <= timing_counter + 1;
+                    
+                    // Capture read data when received (RX count is 1 when 2nd byte arrives)
+                    if (spi_rx_dv && spi_rx_count == 2'd1 && !current_is_write) begin
+                        cmd_rdata <= spi_rx_byte;
                     end
                 end
                 
