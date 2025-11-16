@@ -236,6 +236,7 @@ module tb_main_core;
     end
     if (card_aes_done) begin
       card_encrypted_challenge <= card_aes_ciphertext;
+      $display("[%0t] [CARD] Challenge ready: %h", $time, card_aes_ciphertext);
     end
   end
   
@@ -258,6 +259,10 @@ module tb_main_core;
         if (nfc_shift_reg[6]) begin  // Bit 7 = write flag (shifted position)
           nfc_cmd_count <= 0;
           nfc_write_count <= nfc_write_count + 1;
+          if (nfc_write_count == 0)
+            $display("[%0t] [CARD] ← AUTH_INIT", $time);
+          else if (nfc_write_count == 1)
+            $display("[%0t] [CARD] ← AUTH", $time);
         end else begin
           // READ: Pre-load data for second byte transmission
           if (nfc_write_count == 0) begin
@@ -266,12 +271,16 @@ module tb_main_core;
           end else if (nfc_write_count == 1) begin
             // After AUTH_INIT, before AUTH response: Return encrypted challenge
             nfc_shift_reg <= card_encrypted_challenge[(127 - nfc_cmd_count*8) -: 8];
+            if (nfc_cmd_count == 0)
+              $display("[%0t] [CARD] → Encrypted challenge", $time);
           end else if (card_auth_failed) begin
             // After AUTH response, if auth failed: Return 0xFF for everything
             nfc_shift_reg <= 8'hFF;
           end else begin
             // After AUTH response, if auth OK: Return status (0x00) then encrypted ID (0x42)
             nfc_shift_reg <= (nfc_cmd_count == 0) ? 8'h00 : 8'h42;
+            if (nfc_cmd_count == 0)
+              $display("[%0t] [CARD] ← GET_ID → Encrypted ID", $time);
           end
         end
       end else if (nfc_bit_count == 15) begin
@@ -329,14 +338,7 @@ module tb_main_core;
     // Auth state transitions (key milestones only)
     if (dut.u_auth_controller.state != last_auth_state) begin
       case (dut.u_auth_controller.state)
-        dut.u_auth_controller.ST_LOAD_KEY_START:    $display("[%0t] Loading PSK from EEPROM...", $time);
-        dut.u_auth_controller.ST_AUTH_INIT_SEND:    $display("[%0t] Sending AUTH_INIT to card...", $time);
-        dut.u_auth_controller.ST_DECRYPT_RC:         $display("[%0t] Decrypting challenge Rc...", $time);
-        dut.u_auth_controller.ST_ENCRYPT_AUTH:       $display("[%0t] Encrypting AUTH response...", $time);
-        dut.u_auth_controller.ST_DERIVE_SESSION_KEY: $display("[%0t] Deriving session key K_eph...", $time);
-        dut.u_auth_controller.ST_GET_ID_SEND:        $display("[%0t] Reading card ID...", $time);
-
-        dut.u_auth_controller.ST_DECRYPT_ID:         $display("[%0t] Decrypting card ID...", $time);
+        // Removed redundant prints - using chip's detailed prints instead
         dut.u_auth_controller.ST_SUCCESS: begin
           if (!auth_result_shown) begin
             $display("[%0t] ✓ Card authenticated successfully!", $time);

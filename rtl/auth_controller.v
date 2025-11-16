@@ -333,6 +333,8 @@ module auth_controller (
             if (key_byte_counter < 15) begin
               key_load_req <= 1'b1;
               key_addr <= KEY_BASE_ADDR + key_byte_counter + 1;
+            end else begin
+              $display("[%0t] [CHIP] PSK loaded: %h", $time, {psk[119:0], key_data});
             end
           end
         end
@@ -340,6 +342,7 @@ module auth_controller (
         ST_AUTH_INIT_SEND: begin
           // Send AUTH_INIT command (0x80 0x10) to card via NFC
           // This is simplified - actual implementation needs APDU framing
+          $display("[%0t] [CHIP] → AUTH_INIT", $time);
           nfc_cmd_valid <= 1'b1;
           nfc_cmd_write <= 1'b1;
           nfc_cmd_wdata <= 8'h80;  // CLA
@@ -364,6 +367,7 @@ module auth_controller (
         
         ST_DECRYPT_RC: begin
           // Decrypt encrypted challenge to recover rc
+          $display("[%0t] [CHIP] Decrypting challenge: %h", $time, encrypted_rc);
           aes_start <= 1'b1;
           aes_mode <= 1'b1;  // Decrypt
           aes_key <= psk;
@@ -373,6 +377,10 @@ module auth_controller (
         ST_DECRYPT_RC_WAIT: begin
           if (aes_done) begin
             rc <= aes_block_out[127:64];  // Upper 8 bytes
+            if (aes_block_out[63:0] == 64'h0)
+              $display("[%0t] [CHIP] ✓ Challenge valid | rc=%h", $time, aes_block_out[127:64]);
+            else
+              $display("[%0t] [CHIP] ✗ Wrong key (padding=%h)", $time, aes_block_out[63:0]);
           end
         end
         
@@ -389,6 +397,7 @@ module auth_controller (
         
         ST_ENCRYPT_AUTH: begin
           // Encrypt AES_psk(rt || rc)
+          $display("[%0t] [CHIP] → AUTH response | rt=%h", $time, rt);
           aes_start <= 1'b1;
           aes_mode <= 1'b0;  // Encrypt
           aes_key <= psk;
@@ -413,14 +422,16 @@ module auth_controller (
         ST_DERIVE_SESSION_KEY_WAIT: begin
           if (aes_done) begin
             session_key <= aes_block_out;
+            $display("[%0t] [CHIP] Session key: %h", $time, aes_block_out);
           end
         end
         
         ST_GET_ID_SEND: begin
           // Send GET_ID command
+          $display("[%0t] [CHIP] → GET_ID", $time);
           nfc_cmd_valid <= 1'b1;
           nfc_cmd_write <= 1'b1;
-          nfc_cmd_wdata <= 8'h80;  // CLA
+          nfc_cmd_wdata <= 8'h80;  // CLA (simplified)
           fifo_byte_counter <= 8'h0;
         end
         
@@ -433,7 +444,7 @@ module auth_controller (
         end
         
         ST_DECRYPT_ID: begin
-          // Decrypt card ID with session key
+          // Decrypt card ID using session key
           aes_start <= 1'b1;
           aes_mode <= 1'b1;  // Decrypt
           aes_key <= session_key;
@@ -444,6 +455,7 @@ module auth_controller (
           if (aes_done) begin
             card_id <= aes_block_out;
             card_id_valid <= 1'b1;
+            $display("[%0t] [CHIP] Card ID: %h", $time, aes_block_out);
           end
         end
         
