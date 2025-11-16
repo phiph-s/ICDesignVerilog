@@ -233,6 +233,7 @@ module tb_main_core;
   always @(posedge clk) begin
     if (card_aes_start) begin
       card_aes_start <= 1'b0;
+      $display("[%0t] [CARD] Encrypting: AES_psk(rc || padding) with PSK=%h, rc=%h", $time, card_aes_key, card_aes_plaintext[127:64]);
     end
     if (card_aes_done) begin
       card_encrypted_challenge <= card_aes_ciphertext;
