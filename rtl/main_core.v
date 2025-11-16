@@ -1,7 +1,9 @@
 // Main Core Module - Guardian Chip Top Level
 // Integrates all components for LAYR Authentication System
 
-module main_core (
+module main_core #(
+  parameter UNLOCK_DURATION_PARAM = 32'd500000000 // 5 seconds at 100MHz (default)
+)(
   // System signals
   input  logic         clk,
   input  logic         rst_n,
@@ -91,7 +93,7 @@ module main_core (
   // Door unlock control
   logic         door_unlock_reg;
   logic [31:0]  unlock_timer;
-  localparam    UNLOCK_DURATION = 32'd500000000; // 5 seconds at 100MHz
+  localparam    UNLOCK_DURATION = UNLOCK_DURATION_PARAM;
   
   // ============================================
   // Component instantiations
@@ -230,8 +232,9 @@ module main_core (
         end
         
         KEY_READ_START: begin
-          eeprom_cmd_valid <= 1'b1;
-          if (eeprom_cmd_ready) begin
+          if (!eeprom_cmd_valid) begin
+            eeprom_cmd_valid <= 1'b1;
+          end else if (eeprom_cmd_ready) begin
             key_state <= KEY_READ_WAIT;
             eeprom_cmd_valid <= 1'b0;
           end

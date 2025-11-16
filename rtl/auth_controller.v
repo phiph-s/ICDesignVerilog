@@ -63,6 +63,7 @@ module auth_controller (
     ST_AUTH_INIT_SEND,
     ST_AUTH_INIT_WAIT,
     ST_AUTH_INIT_READ,
+    ST_AUTH_INIT_READ_WAIT,
     ST_DECRYPT_RC,
     ST_DECRYPT_RC_WAIT,
     ST_GEN_NONCE,
@@ -150,7 +151,16 @@ module auth_controller (
       end
       
       ST_AUTH_INIT_READ: begin
-        if (fifo_byte_counter == 16) next_state = ST_DECRYPT_RC;
+        if (nfc_cmd_ready) next_state = ST_AUTH_INIT_READ_WAIT;
+      end
+      
+      ST_AUTH_INIT_READ_WAIT: begin
+        if (nfc_cmd_done) begin
+          if (fifo_byte_counter >= 15)  // After 16 bytes (0-15)
+            next_state = ST_DECRYPT_RC;
+          else
+            next_state = ST_AUTH_INIT_READ;
+        end
       end
       
       ST_DECRYPT_RC: begin
@@ -158,7 +168,14 @@ module auth_controller (
       end
       
       ST_DECRYPT_RC_WAIT: begin
-        if (aes_done) next_state = ST_GEN_NONCE;
+        // Check if decryption was successful by verifying padding
+        // Lower 64 bits should be zero if correct key was used
+        if (aes_done) begin
+          if (aes_block_out[63:0] == 64'h0)
+            next_state = ST_GEN_NONCE;
+          else
+            next_state = ST_FAILED;  // Invalid challenge - wrong key
+        end
       end
       
       ST_GEN_NONCE: begin
@@ -294,8 +311,8 @@ module auth_controller (
         
         ST_LOAD_KEY_WAIT: begin
           if (key_data_valid) begin
-            // Store first byte in MSB position
-            psk <= {key_data, psk[119:0]};
+            // Shift in key bytes from EEPROM (little-endian)
+            psk <= {psk[119:0], key_data};  // Shift left, new byte to LSB
             key_byte_counter <= key_byte_counter + 1;
             
             // Request next byte if not done
@@ -309,7 +326,7 @@ module auth_controller (
         ST_LOAD_KEY_BYTES: begin
           if (key_data_valid) begin
             // Shift in key bytes
-            psk <= {key_data, psk[119:0]};
+            psk <= {psk[119:0], key_data};  // Shift left, new byte to LSB
             key_byte_counter <= key_byte_counter + 1;
             
             // Request next byte if not done
@@ -330,11 +347,19 @@ module auth_controller (
         end
         
         ST_AUTH_INIT_READ: begin
-          // Read 16 bytes of encrypted challenge from card
-          // In a real implementation, this would read from NFC FIFO
-          // For now, we simulate receiving all 16 bytes at once
-          encrypted_rc <= {encrypted_rc[119:0], nfc_cmd_rdata};
-          fifo_byte_counter <= fifo_byte_counter + 1;
+          // Request to read one byte from NFC (simulated FIFO read)
+          nfc_cmd_valid <= 1'b1;
+          nfc_cmd_write <= 1'b0;  // Read
+          nfc_cmd_wdata <= 8'h00;  // Dummy data
+        end
+        
+        ST_AUTH_INIT_READ_WAIT: begin
+          // Wait for read to complete and store byte
+          if (nfc_cmd_done) begin
+            // Bytes come from NFC, shift left with new byte to LSB
+            encrypted_rc <= {encrypted_rc[119:0], nfc_cmd_rdata};
+            fifo_byte_counter <= fifo_byte_counter + 1;
+          end
         end
         
         ST_DECRYPT_RC: begin
