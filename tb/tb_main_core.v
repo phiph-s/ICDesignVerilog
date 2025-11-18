@@ -28,8 +28,8 @@ module tb_main_core;
   logic status_fault;
   logic status_busy;
   
-  // Control
-  logic start_auth_btn;
+  // Control - NFC IRQ signal (simulates card detection)
+  logic nfc_irq;
   
   // Test parameters
   localparam [127:0] TEST_PSK = 128'h2b7e151628aed2a6abf7158809cf4f3c;
@@ -59,7 +59,7 @@ module tb_main_core;
     .status_unlock    (status_unlock),
     .status_fault     (status_fault),
     .status_busy      (status_busy),
-    .start_auth_btn   (start_auth_btn)
+    .nfc_irq          (nfc_irq)
   );
   
   // Clock generation (100MHz)
@@ -408,7 +408,7 @@ module tb_main_core;
     
     // Initialize
     rst_n = 0;
-    start_auth_btn = 0;
+    nfc_irq = 0;
     card_has_wrong_key = 0;
     
     // Reset
@@ -426,9 +426,9 @@ module tb_main_core;
     #100;
     
     auth_completed_flag = 0;
-    start_auth_btn = 1;
+    nfc_irq = 1;
     #100;
-    start_auth_btn = 0;
+    nfc_irq = 0;
     
     // Wait for authentication to complete
     fork
@@ -466,9 +466,9 @@ module tb_main_core;
     #100;
     
     auth_completed_flag = 0;
-    start_auth_btn = 1;
+    nfc_irq = 1;
     #100;
-    start_auth_btn = 0;
+    nfc_irq = 0;
     
     fork
       begin
@@ -505,9 +505,9 @@ module tb_main_core;
     #100;
     
     auth_completed_flag = 0;
-    start_auth_btn = 1;
+    nfc_irq = 1;
     #100;
-    start_auth_btn = 0;
+    nfc_irq = 0;
     
     fork
       begin

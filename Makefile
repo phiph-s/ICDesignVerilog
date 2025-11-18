@@ -12,11 +12,6 @@ sim_nonce:
 	iverilog -g2012 -o sim_nonce.out rtl/nonce_generator.v tb/tb_nonce_generator.v
 	vvp sim_nonce.out
 
-# SPI-only sim
-sim_spi:
-	iverilog -g2012 -o sim_spi.out rtl/spi_master.sv tb/tb_spi_master.sv tb/spi_slave_dummy.v
-	vvp sim_spi.out
-
 # AT25010 Interface sim
 sim_at25010:
 	iverilog -g2012 -o sim_at25010.out ip/spi-master/SPI_Master.v ip/spi-master/SPI_Master_With_Single_CS.v rtl/at25010_interface.v tb/tb_at25010_interface.v
@@ -31,11 +26,6 @@ sim_mfrc522:
 sim_detector:
 	iverilog -g2012 -o sim_detector.out rtl/nfc_card_detector.v tb/tb_nfc_card_detector.v
 	vvp sim_detector.out
-
-# Auth Controller sim
-sim_auth:
-	iverilog -g2012 -o sim_auth.out $(SRC_IP) rtl/aes_core.v rtl/auth_controller.v tb/tb_auth_controller.v
-	vvp sim_auth.out
 
 # Main Core (full integration) sim
 sim_main:

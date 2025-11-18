@@ -8,6 +8,9 @@ module main_core #(
   input  logic         clk,
   input  logic         rst_n,
   
+  // MFRC522 IRQ input (card detection)
+  input  logic         nfc_irq,
+  
   // SPI interface to MFRC522 NFC Reader
   output logic         nfc_spi_cs_n,
   output logic         nfc_spi_sclk,
@@ -26,10 +29,7 @@ module main_core #(
   // Status indicators
   output logic         status_unlock,    // Green LED - door unlocked
   output logic         status_fault,     // Red LED - authentication failed
-  output logic         status_busy,      // Yellow LED - busy authenticating
-  
-  // Optional: Start authentication (e.g., from button or auto-detect)
-  input  logic         start_auth_btn
+  output logic         status_busy       // Yellow LED - busy authenticating
 );
 
   // Authentication timeout (in clock cycles)
@@ -40,7 +40,6 @@ module main_core #(
   // ============================================
   
   // Card Detector signals
-  logic         nfc_irq;              // Simulated IRQ (in real HW from MFRC522 IRQ pin)
   logic         card_detected;
   logic [31:0]  card_uid;
   logic         card_ready;
@@ -120,9 +119,6 @@ module main_core #(
       nfc_cmd_wdata = auth_nfc_cmd_wdata;
     end
   end
-  
-  // Simulated IRQ generation (in real HW, this comes from MFRC522 IRQ pin)
-  assign nfc_irq = start_auth_btn;
   
   // Timer/Watchdog
   logic         timeout_start;
