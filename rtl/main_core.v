@@ -39,6 +39,25 @@ module main_core #(
   // Internal signals
   // ============================================
   
+  // Card Detector signals
+  logic         nfc_irq;              // Simulated IRQ (in real HW from MFRC522 IRQ pin)
+  logic         card_detected;
+  logic [31:0]  card_uid;
+  logic         card_ready;
+  logic         detector_start_auth;
+  logic         detection_error;
+  logic [7:0]   error_code;
+  
+  // NFC signals - shared between detector and auth controller
+  logic         det_nfc_cmd_valid;
+  logic         det_nfc_cmd_write;
+  logic [5:0]   det_nfc_cmd_addr;
+  logic [7:0]   det_nfc_cmd_wdata;
+  logic         auth_nfc_cmd_valid;
+  logic         auth_nfc_cmd_write;
+  logic [5:0]   auth_nfc_cmd_addr;
+  logic [7:0]   auth_nfc_cmd_wdata;
+  
   // AuthController signals
   logic         auth_start;
   logic         auth_success;
@@ -76,7 +95,7 @@ module main_core #(
   logic [63:0]  nonce;
   logic         nonce_valid;
   
-  // NFC Interface signals
+  // NFC Interface signals (shared)
   logic         nfc_cmd_valid;
   logic         nfc_cmd_ready;
   logic         nfc_cmd_write;
@@ -84,6 +103,26 @@ module main_core #(
   logic [7:0]   nfc_cmd_wdata;
   logic [7:0]   nfc_cmd_rdata;
   logic         nfc_cmd_done;
+  
+  // NFC arbiter - mux between detector and auth controller
+  always_comb begin
+    if (!auth_busy && card_detected && !card_ready) begin
+      // Detector has priority during detection phase
+      nfc_cmd_valid = det_nfc_cmd_valid;
+      nfc_cmd_write = det_nfc_cmd_write;
+      nfc_cmd_addr  = det_nfc_cmd_addr;
+      nfc_cmd_wdata = det_nfc_cmd_wdata;
+    end else begin
+      // Auth controller has priority during authentication
+      nfc_cmd_valid = auth_nfc_cmd_valid;
+      nfc_cmd_write = auth_nfc_cmd_write;
+      nfc_cmd_addr  = auth_nfc_cmd_addr;
+      nfc_cmd_wdata = auth_nfc_cmd_wdata;
+    end
+  end
+  
+  // Simulated IRQ generation (in real HW, this comes from MFRC522 IRQ pin)
+  assign nfc_irq = start_auth_btn;
   
   // Timer/Watchdog
   logic         timeout_start;
@@ -98,6 +137,29 @@ module main_core #(
   // ============================================
   // Component instantiations
   // ============================================
+  
+  // NFC Card Detector - handles ISO14443A card detection
+  nfc_card_detector u_card_detector (
+    .clk              (clk),
+    .rst_n            (rst_n),
+    .nfc_irq          (nfc_irq),
+    .card_detected    (card_detected),
+    .card_uid         (card_uid),
+    .card_ready       (card_ready),
+    .start_auth       (detector_start_auth),
+    .nfc_cmd_valid    (det_nfc_cmd_valid),
+    .nfc_cmd_ready    (nfc_cmd_ready),
+    .nfc_cmd_write    (det_nfc_cmd_write),
+    .nfc_cmd_addr     (det_nfc_cmd_addr),
+    .nfc_cmd_wdata    (det_nfc_cmd_wdata),
+    .nfc_cmd_rdata    (nfc_cmd_rdata),
+    .nfc_cmd_done     (nfc_cmd_done),
+    .detection_error  (detection_error),
+    .error_code       (error_code)
+  );
+  
+  // Start authentication when detector signals card is ready
+  assign auth_start = detector_start_auth;
   
   // Authentication Controller
   auth_controller u_auth_controller (
@@ -122,11 +184,11 @@ module main_core #(
     .nonce_req        (nonce_req),
     .nonce            (nonce),
     .nonce_valid      (nonce_valid),
-    .nfc_cmd_valid    (nfc_cmd_valid),
+    .nfc_cmd_valid    (auth_nfc_cmd_valid),
     .nfc_cmd_ready    (nfc_cmd_ready),
-    .nfc_cmd_write    (nfc_cmd_write),
-    .nfc_cmd_addr     (nfc_cmd_addr),
-    .nfc_cmd_wdata    (nfc_cmd_wdata),
+    .nfc_cmd_write    (auth_nfc_cmd_write),
+    .nfc_cmd_addr     (auth_nfc_cmd_addr),
+    .nfc_cmd_wdata    (auth_nfc_cmd_wdata),
     .nfc_cmd_rdata    (nfc_cmd_rdata),
     .nfc_cmd_done     (nfc_cmd_done),
     .timeout_start    (timeout_start),

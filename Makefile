@@ -27,6 +27,11 @@ sim_mfrc522:
 	iverilog -g2012 -o sim_mfrc522.out ip/spi-master/SPI_Master.v ip/spi-master/SPI_Master_With_Single_CS.v rtl/mfrc522_interface.v tb/tb_mfrc522_interface.v
 	vvp sim_mfrc522.out
 
+# NFC Card Detector sim
+sim_detector:
+	iverilog -g2012 -o sim_detector.out rtl/nfc_card_detector.v tb/tb_nfc_card_detector.v
+	vvp sim_detector.out
+
 # Auth Controller sim
 sim_auth:
 	iverilog -g2012 -o sim_auth.out $(SRC_IP) rtl/aes_core.v rtl/auth_controller.v tb/tb_auth_controller.v
@@ -36,7 +41,7 @@ sim_auth:
 sim_main:
 	iverilog -g2012 -o sim_main.out $(SRC_IP) ip/spi-master/SPI_Master.v ip/spi-master/SPI_Master_With_Single_CS.v \
 		rtl/aes_core.v rtl/nonce_generator.v rtl/at25010_interface.v rtl/mfrc522_interface.v \
-		rtl/auth_controller.v rtl/main_core.v tb/tb_main_core.v
+		rtl/nfc_card_detector.v rtl/auth_controller.v rtl/main_core.v tb/tb_main_core.v
 	vvp sim_main.out
 
 clean:
