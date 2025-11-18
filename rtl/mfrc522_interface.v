@@ -139,7 +139,8 @@ module mfrc522_interface #(
                     end
                     
                     // Capture read data when received (RX count is 1 when 2nd byte arrives)
-                    if (spi_rx_dv && spi_rx_count == 2'd1 && !current_is_write) begin
+                    // Even during write, SPI is full-duplex so we receive data
+                    if (spi_rx_dv && spi_rx_count == 2'd1) begin
                         cmd_rdata <= spi_rx_byte;
                     end
                 end

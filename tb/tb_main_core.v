@@ -184,6 +184,14 @@ module tb_main_core;
   logic card_auth_failed;
   logic auth_response_received;  // Track if AUTH response was received
   
+  // ISO14443A Detection support
+  logic [31:0] mock_card_uid;  // Card UID for ANTICOLL response
+  integer iso_transaction_count;  // Count ISO14443A transactions to know what to return
+  initial begin
+    mock_card_uid = 32'h01020304;  // Fixed test UID
+    iso_transaction_count = 0;
+  end
+  
   // AES core for card to encrypt challenge with real AES
   logic card_aes_start;
   logic card_aes_done;
@@ -242,7 +250,9 @@ module tb_main_core;
   end
   
   // NFC SPI slave behavior - simulates MFRC522 reading from real card
-  // Simplified: If card_auth_failed, return 0xFF for everything except initial challenge
+  // Handles TWO protocols:
+  //   1. ISO14443A Detection (addr=0x09): Write command → Read response in same transaction (full duplex)
+  //   2. LAYR Auth (addr=0x00): AUTH_INIT→Challenge, AUTH→Result
   always @(posedge nfc_spi_sclk or posedge nfc_spi_cs_n) begin
     if (nfc_spi_cs_n) begin
       nfc_bit_count <= 0;
@@ -252,48 +262,79 @@ module tb_main_core;
       nfc_bit_count <= nfc_bit_count + 1;
       
       if (nfc_bit_count == 7) begin
-        // First byte: address/command  (use current byte with MOSI bit)
-        nfc_is_write <= nfc_shift_reg[6];  // Bit 7 of the completed byte
-        nfc_addr <= {nfc_shift_reg[5:0], nfc_spi_mosi, 1'b0};
+        // First byte complete: address/command [R/W][A5:A0][0]
+        nfc_is_write <= nfc_shift_reg[6];
+        nfc_addr <= {nfc_shift_reg[5:0], nfc_spi_mosi};
         
-        // Reset byte counter on new write command (new transaction)
-        if (nfc_shift_reg[6]) begin  // Bit 7 = write flag (shifted position)
-          nfc_cmd_count <= 0;
-          nfc_write_count <= nfc_write_count + 1;
-          if (nfc_write_count == 0)
-            $display("[%0t] [CARD] ← AUTH_INIT", $time);
-          else if (nfc_write_count == 1)
-            $display("[%0t] [CARD] ← AUTH", $time);
-        end else begin
-          // READ: Pre-load data for second byte transmission
-          if (nfc_write_count == 0) begin
-            // Before any WRITE (shouldn't happen): Return 0
-            nfc_shift_reg <= 8'h00;
-          end else if (nfc_write_count == 1) begin
-            // After AUTH_INIT, before AUTH response: Return encrypted challenge
-            nfc_shift_reg <= card_encrypted_challenge[(127 - nfc_cmd_count*8) -: 8];
-            if (nfc_cmd_count == 0)
-              $display("[%0t] [CARD] → Encrypted challenge", $time);
-          end else if (card_auth_failed) begin
-            // After AUTH response, if auth failed: Return 0xFF for everything
-            nfc_shift_reg <= 8'hFF;
+        if (nfc_shift_reg[6]) begin
+          // WRITE: Prepare response for 2nd byte based on address
+          if ({nfc_shift_reg[5:0], nfc_spi_mosi} == 8'h12) begin
+            // ISO144443A protocol (addr 0x09)
+            // Return response based on transaction count
+            case (iso_transaction_count)
+              0: nfc_shift_reg <= 8'h04;  // ATQA low byte for REQA
+              1: nfc_shift_reg <= mock_card_uid[7:0];  // UID first byte for ANTICOLL
+              2: nfc_shift_reg <= 8'h08;  // SAK for SELECT
+              default: nfc_shift_reg <= 8'hFF;  // Error
+            endcase
+          end else if ({nfc_shift_reg[5:0], nfc_spi_mosi} == 8'h00) begin
+            // LAYR Auth protocol (addr 0x00) - WRITE transaction
+            nfc_shift_reg <= 8'h00;  // Just acknowledge write
           end else begin
-            // After AUTH response, if auth OK: Return status (0x00) then encrypted ID (0x42)
-            nfc_shift_reg <= (nfc_cmd_count == 0) ? 8'h00 : 8'h42;
-            if (nfc_cmd_count == 0)
-              $display("[%0t] [CARD] ← GET_ID → Encrypted ID", $time);
+            nfc_shift_reg <= 8'h00;  // Unknown address
+          end
+          nfc_cmd_count <= 0;
+        end else begin
+          // READ command: prepare response based on address
+          if ({nfc_shift_reg[5:0], nfc_spi_mosi} == 8'h00) begin
+            // LAYR Auth protocol - READ encrypted challenge or result
+            if (nfc_write_count == 1) begin
+              // After AUTH_INIT: Return encrypted challenge (MSB first!)
+              nfc_shift_reg <= card_encrypted_challenge[(127 - nfc_cmd_count*8) -: 8];
+              if (nfc_cmd_count == 0)
+                $display("[%0t] [CARD] → Encrypted challenge", $time);
+            end else if (card_auth_failed) begin
+              // After AUTH (failed): Return 0xFF
+              nfc_shift_reg <= 8'hFF;
+            end else begin
+              // After AUTH (success): Return status or encrypted ID
+              nfc_shift_reg <= (nfc_cmd_count == 0) ? 8'h00 : 8'h42;
+              if (nfc_cmd_count == 0)
+                $display("[%0t] [CARD] ← GET_ID → Encrypted ID", $time);
+            end
+            // Don't increment here - will be done in bit 15
+          end else begin
+            nfc_shift_reg <= 8'h00;  // Unknown address
           end
         end
       end else if (nfc_bit_count == 15) begin
-        // Second byte: data
+        // Second byte complete: store data and update state
         if (nfc_is_write) begin
-          // WRITE received
-          if (nfc_write_count >= 2) begin
-            // Second+ WRITE: AUTH response received
-            auth_response_received <= 1;
+          nfc_data <= {nfc_shift_reg[6:0], nfc_spi_mosi};
+          
+          if (nfc_addr == 8'h12) begin
+            // ISO14443A: increment transaction count
+            iso_transaction_count <= iso_transaction_count + 1;
+            if ({nfc_shift_reg[6:0], nfc_spi_mosi} == 8'h26) begin
+              $display("[%0t] [CARD] ← REQA (txn %0d)", $time, iso_transaction_count);
+            end else if ({nfc_shift_reg[6:0], nfc_spi_mosi} == 8'h93) begin
+              $display("[%0t] [CARD] ← ANTICOLL/SELECT (txn %0d)", $time, iso_transaction_count);
+            end
+          end else if (nfc_addr == 8'h00) begin
+            // LAYR Auth: track write count
+            nfc_write_count <= nfc_write_count + 1;
+            if (nfc_write_count == 0) begin
+              $display("[%0t] [CARD] ← AUTH_INIT", $time);
+              iso_transaction_count <= 0;  // Reset ISO counter for next auth cycle
+            end else if (nfc_write_count == 1) begin
+              $display("[%0t] [CARD] ← AUTH", $time);
+            end
+            
+            if (nfc_write_count >= 2) begin
+              auth_response_received <= 1;
+            end
           end
         end else begin
-          // Reading from card - increment counter after read completes
           nfc_cmd_count <= nfc_cmd_count + 1;
         end
       end

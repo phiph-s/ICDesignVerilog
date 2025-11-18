@@ -317,24 +317,8 @@ module main_core #(
     end
   end
   
-  // ============================================
-  // Authentication Start Control
-  // ============================================
-  
-  logic start_auth_btn_d;
-  logic start_auth_pulse;
-  
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      start_auth_btn_d <= 1'b0;
-      start_auth_pulse <= 1'b0;
-    end else begin
-      start_auth_btn_d <= start_auth_btn;
-      start_auth_pulse <= start_auth_btn && !start_auth_btn_d;
-    end
-  end
-  
-  assign auth_start = start_auth_pulse;
+  // Note: Authentication start is now controlled by nfc_card_detector
+  // The detector triggers auth_start after successful card detection
   
   // ============================================
   // Timeout Watchdog
