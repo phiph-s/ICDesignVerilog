@@ -1,0 +1,129 @@
+@startuml Guardian Chip System Architecture
+title Guardian Chip - Complete Hardware Architecture
+
+skinparam componentStyle rectangle
+skinparam linetype ortho
+
+package "External World" {
+    component [NFC Card\n(ISO14443A)] as Card
+    component [MFRC522\nNFC Reader] as MFRC522
+    component [AT25010\nEEPROM\n(128 bytes)] as EEPROM
+    component [Door Lock\nActuator] as Door
+    component [Status LEDs] as LEDs
+    component [Button] as Button
+}
+
+package "Guardian Chip (FPGA/ASIC)" {
+    
+    rectangle "Main Core" as MainCore {
+        
+        rectangle "NFC Card Detector" as Detector {
+            note right
+                State Machine:
+                IDLE → SEND_REQA → WAIT_ATQA →
+                CHECK_ATQA → SEND_ANTICOLL →
+                WAIT_UID → CHECK_UID →
+                SEND_SELECT → WAIT_SAK →
+                CHECK_SAK → CARD_READY
+            end note
+        }
+        
+        rectangle "NFC Arbiter" as Arbiter {
+            note right
+                Multiplexes NFC interface:
+                • Detection phase → Detector
+                • Auth phase → Auth Controller
+            end note
+        }
+        
+        rectangle "Auth Controller" as AuthCtrl {
+            note right
+                State Machine:
+                IDLE → LOAD_KEY → AUTH_INIT_SEND →
+                AUTH_INIT_READ → DECRYPT_RC →
+                NONCE_GEN → SESSION_KEY →
+                AUTH_SEND → GET_ID_SEND →
+                DECRYPT_ID → SUCCESS/FAILED
+            end note
+        }
+        
+        rectangle "AES Core" as AESCore {
+            note right
+                • 128-bit AES-128 ECB
+                • 10 rounds
+                • Shared encrypt/decrypt
+                • Key expansion
+            end note
+        }
+        
+        rectangle "Nonce Generator" as Nonce {
+            note right
+                • 64-bit LFSR
+                • Galois configuration
+                • Generates rt (8 bytes)
+            end note
+        }
+        
+        rectangle "MFRC522 Interface" as MFRCIntf {
+            note right
+                • SPI Mode 0
+                • Register read/write
+                • FIFO operations
+            end note
+        }
+        
+        rectangle "AT25010 Interface" as EEPROMIntf {
+            note right
+                • SPI Mode 0/3
+                • Sequential read
+                • Page write
+            end note
+        }
+    }
+}
+
+' External connections
+Card -- MFRC522 : RF Field\n13.56 MHz
+MFRC522 -- MFRCIntf : SPI\n(CS, SCLK, MOSI, MISO)
+EEPROM -- EEPROMIntf : SPI\n(CS, SCLK, MOSI, MISO)
+Button -- Detector : IRQ Trigger\n(Simulated)
+MainCore -- Door : door_unlock
+MainCore -- LEDs : status_unlock\nstatus_fault\nstatus_busy
+
+' Internal connections
+MFRC522 ..> Detector : nfc_irq
+Detector --> Arbiter : det_nfc_cmd_*
+AuthCtrl --> Arbiter : auth_nfc_cmd_*
+Arbiter --> MFRCIntf : nfc_cmd_*
+MFRCIntf ..> Arbiter : nfc_cmd_done\nnfc_cmd_rdata
+
+Detector --> AuthCtrl : start_auth
+AuthCtrl ..> Detector : auth_busy
+
+AuthCtrl --> EEPROMIntf : key_load_req\nkey_addr
+EEPROMIntf ..> AuthCtrl : key_data\nkey_valid
+
+AuthCtrl --> AESCore : aes_start\naes_mode\naes_key\naes_block_in
+AESCore ..> AuthCtrl : aes_done\naes_block_out
+
+AuthCtrl --> Nonce : nonce_req
+Nonce ..> AuthCtrl : nonce_data\nnonce_valid
+
+legend right
+    **Signal Types:**
+    —— : Data/Power connections
+    ..> : Control/Status signals
+    
+    **Protocols:**
+    • ISO14443A: Card detection
+    • LAYR: Authentication
+    • SPI: Peripheral communication
+    
+    **Key Features:**
+    • Automatic card detection
+    • Zero-knowledge proof auth
+    • Hardware AES encryption
+    • Secure key storage
+endlegend
+
+@enduml
