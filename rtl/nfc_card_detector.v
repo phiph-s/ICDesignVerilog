@@ -337,7 +337,6 @@ module nfc_card_detector (
                 command_sent <= 1'b0;
                 if (tx_index < tx_length - 1) tx_index <= tx_index + 1;
             end
-            card_detected <= 1'b1;
         end
         
         ST_TX_CMD: begin
@@ -409,6 +408,7 @@ module nfc_card_detector (
         ST_CHECK_ATQA: begin
           if (atqa_response == ATQA_MIFARE) begin
             $display("[%0t] [NFC_DETECTOR] ← ATQA: %h (valid)", $time, atqa_response);
+            card_detected <= 1'b1;
             retry_count <= 4'h0;
           end else begin
             $display("[%0t] [NFC_DETECTOR] ← ATQA: %h (invalid, retry)", $time, atqa_response);
@@ -434,6 +434,7 @@ module nfc_card_detector (
         ST_CARD_READY: begin
           if (!card_ready) begin
             card_ready <= 1'b1;
+            card_uid <= uid_buffer;
             start_auth <= 1'b1;
             $display("[%0t] [NFC_DETECTOR] Card ready → Starting authentication", $time);
           end

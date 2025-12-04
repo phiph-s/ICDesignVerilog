@@ -105,7 +105,7 @@ module main_core #(
   
   // NFC arbiter - mux between detector and auth controller
   always_comb begin
-    if (!auth_busy && card_detected && !card_ready) begin
+    if (!auth_busy && (card_detected || det_nfc_cmd_valid) && !card_ready) begin
       // Detector has priority during detection phase
       nfc_cmd_valid = det_nfc_cmd_valid;
       nfc_cmd_write = det_nfc_cmd_write;
