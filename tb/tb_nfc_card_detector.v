@@ -65,6 +65,8 @@ module tb_nfc_card_detector;
   
   mock_state_t mock_state = MOCK_IDLE;
   logic [31:0] mock_card_uid = 32'h12345678;
+  logic [7:0] mock_rx_buffer [0:15];
+  integer mock_rx_index;
   
   // NFC command/response handler
   integer delay_counter;
@@ -80,6 +82,7 @@ module tb_nfc_card_detector;
       delay_counter <= 0;
       cmd_processing <= 1'b0;
       irq_prev_mock <= 1'b0;
+      mock_rx_index <= 0;
     end else begin
       irq_prev_mock <= nfc_irq;
       
@@ -106,34 +109,77 @@ module tb_nfc_card_detector;
         
         // Latch the command and prepare response (will be sent when processing completes)
         if (nfc_cmd_write) begin
-          $display("[%0t] [MOCK] Received command: 0x%02h, state=%0d", $time, nfc_cmd_wdata, mock_state);
-          case (nfc_cmd_wdata)
-            8'h26: begin  // REQA
-              mock_state <= MOCK_REQA;
-              nfc_cmd_rdata <= 8'h04;  // ATQA low byte
-              $display("[%0t] [MOCK] Preparing ATQA: 0x04", $time);
-            end
-            
-            8'h93: begin  // ANTICOLL or SELECT
-              if (mock_state == MOCK_REQA) begin
-                mock_state <= MOCK_ANTICOLL;
-                nfc_cmd_rdata <= mock_card_uid[7:0];  // UID first byte
-                $display("[%0t] [MOCK] Preparing UID byte: 0x%02h", $time, mock_card_uid[7:0]);
-              end else if (mock_state == MOCK_ANTICOLL) begin
-                mock_state <= MOCK_SELECT;
-                nfc_cmd_rdata <= 8'h08;  // SAK: complete, no cascade
-                $display("[%0t] [MOCK] Preparing SAK: 0x08", $time);
-              end else begin
-                $display("[%0t] [MOCK] ERROR: Unexpected 0x93 in state %0d", $time, mock_state);
-                nfc_cmd_rdata <= 8'hFF;
+          $display("[%0t] [MOCK] Write Addr: 0x%02h, Data: 0x%02h, state=%0d", $time, nfc_cmd_addr, nfc_cmd_wdata, mock_state);
+          
+          if (nfc_cmd_addr == 6'h09) begin // REG_FIFODATA
+              case (nfc_cmd_wdata)
+                8'h26: begin  // REQA
+                  mock_state <= MOCK_REQA;
+                  mock_rx_buffer[0] <= 8'h04;
+                  mock_rx_buffer[1] <= 8'h00;
+                  mock_rx_index <= 0;
+                  $display("[%0t] [MOCK] Preparing ATQA: 0x0004", $time);
+                end
+                
+                8'h93: begin  // ANTICOLL or SELECT
+                  if (mock_state == MOCK_REQA) begin
+                    mock_state <= MOCK_ANTICOLL;
+                    mock_rx_buffer[0] <= mock_card_uid[7:0];
+                    mock_rx_buffer[1] <= mock_card_uid[15:8];
+                    mock_rx_buffer[2] <= mock_card_uid[23:16];
+                    mock_rx_buffer[3] <= mock_card_uid[31:24];
+                    mock_rx_buffer[4] <= mock_card_uid[7:0] ^ mock_card_uid[15:8] ^ mock_card_uid[23:16] ^ mock_card_uid[31:24]; // BCC
+                    mock_rx_index <= 0;
+                    $display("[%0t] [MOCK] Preparing UID: %h", $time, mock_card_uid);
+                  end else if (mock_state == MOCK_ANTICOLL) begin
+                    mock_state <= MOCK_SELECT;
+                    mock_rx_buffer[0] <= 8'h08; // SAK
+                    mock_rx_buffer[1] <= 8'hB6; // CRC1
+                    mock_rx_buffer[2] <= 8'hDB; // CRC2
+                    mock_rx_index <= 0;
+                    $display("[%0t] [MOCK] Preparing SAK: 0x08", $time);
+                  end else begin
+                    // It might be the SELECT command itself (also 0x93)
+                    // If we are already in MOCK_SELECT, maybe we stay or reset?
+                    // For now, just ignore extra 0x93 if it happens
+                    $display("[%0t] [MOCK] Info: 0x93 in state %0d", $time, mock_state);
+                  end
+                end
+                
+                default: begin
+                   // Data bytes for ANTICOLL/SELECT (UID, BCC, CRC)
+                   // Just ignore them
+                   $display("[%0t] [MOCK] Data byte: 0x%02h", $time, nfc_cmd_wdata);
+                end
+              endcase
+          end else if (nfc_cmd_addr == 6'h01) begin // REG_COMMAND
+              if (nfc_cmd_wdata == 8'h0C) begin // PCD_TRANSCEIVE
+                  $display("[%0t] [MOCK] PCD_TRANSCEIVE", $time);
               end
+          end else begin
+              // Other registers (ComIrq, FIFOLevel, BitFraming, TxMode, RxMode)
+              // Just acknowledge
+              $display("[%0t] [MOCK] Register write to 0x%02h", $time, nfc_cmd_addr);
+          end
+        end else begin
+            // Read operation
+            if (nfc_cmd_addr == 6'h04) begin // REG_COMIRQ
+                // Return 0x20 (RxIRq) to simulate data received
+                // Only if we are in a state where we expect data
+                if (mock_state != MOCK_IDLE)
+                    nfc_cmd_rdata <= 8'h20; // RxIRq
+                else
+                    nfc_cmd_rdata <= 8'h00;
+            end else if (nfc_cmd_addr == 6'h0A) begin // REG_FIFOLEVEL
+                // Return count
+                if (mock_state == MOCK_REQA) nfc_cmd_rdata <= 8'h02; // ATQA is 2 bytes
+                else if (mock_state == MOCK_ANTICOLL) nfc_cmd_rdata <= 8'h05; // UID+BCC is 5 bytes
+                else if (mock_state == MOCK_SELECT) nfc_cmd_rdata <= 8'h03; // SAK+CRC is 3 bytes
+                else nfc_cmd_rdata <= 8'h00;
+            end else if (nfc_cmd_addr == 6'h09) begin // REG_FIFODATA
+                nfc_cmd_rdata <= mock_rx_buffer[mock_rx_index];
+                mock_rx_index <= mock_rx_index + 1;
             end
-            
-            default: begin
-              $display("[%0t] [MOCK] ERROR: Unknown command 0x%02h", $time, nfc_cmd_wdata);
-              nfc_cmd_rdata <= 8'hFF;  // Error
-            end
-          endcase
         end
         // Note: nfc_cmd_done will be set after processing delay
       end

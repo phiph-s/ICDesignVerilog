@@ -37,6 +37,8 @@ module nfc_card_detector (
   localparam [5:0] REG_FIFODATA   = 6'h09;
   localparam [5:0] REG_FIFOLEVEL  = 6'h0A;
   localparam [5:0] REG_BITFRAMING = 6'h0D;
+  localparam [5:0] REG_TXMODE     = 6'h12;
+  localparam [5:0] REG_RXMODE     = 6'h13;
   
   // MFRC522 Commands
   localparam [7:0] PCD_IDLE       = 8'h00;
@@ -57,6 +59,10 @@ module nfc_card_detector (
     ST_WAIT_IRQ,
     
     // Generic Transaction States
+    ST_CLEAR_IRQ,       // New: Clear interrupts
+    ST_FLUSH_FIFO,      // New: Flush FIFO
+    ST_CONFIG_CRC,      // New: Configure Tx CRC
+    ST_CONFIG_RX_CRC,   // New: Configure Rx CRC
     ST_TX_FIFO,
     ST_TX_CMD,
     ST_TX_FRAMING,
@@ -119,19 +125,35 @@ module nfc_card_detector (
     case (state)
       ST_IDLE: begin
         if (irq_detected) begin
-            next_state = ST_TX_FIFO;
+            next_state = ST_CLEAR_IRQ;
             next_protocol_state = PROT_REQA;
         end
       end
       
       ST_WAIT_IRQ: begin
         if (irq_detected) begin
-            next_state = ST_TX_FIFO;
+            next_state = ST_CLEAR_IRQ;
             next_protocol_state = PROT_REQA;
         end
       end
       
       // --- Generic Transaction Sequence ---
+      ST_CLEAR_IRQ: begin
+        if (nfc_cmd_done) next_state = ST_FLUSH_FIFO;
+      end
+      
+      ST_FLUSH_FIFO: begin
+        if (nfc_cmd_done) next_state = ST_CONFIG_CRC;
+      end
+      
+      ST_CONFIG_CRC: begin
+        if (nfc_cmd_done) next_state = ST_CONFIG_RX_CRC;
+      end
+
+      ST_CONFIG_RX_CRC: begin
+        if (nfc_cmd_done) next_state = ST_TX_FIFO;
+      end
+      
       ST_TX_FIFO: begin
         if (nfc_cmd_ready && !command_sent) begin
             // Wait for write to complete
@@ -286,6 +308,62 @@ module nfc_card_detector (
         end
         
         // --- Generic Transaction Execution ---
+        ST_CLEAR_IRQ: begin
+            if (!command_sent && nfc_cmd_ready) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_COMIRQ;
+                nfc_cmd_wdata <= 8'h7F; // Clear all interrupts
+                command_sent <= 1'b1;
+            end else if (nfc_cmd_done) begin
+                command_sent <= 1'b0;
+            end
+        end
+        
+        ST_FLUSH_FIFO: begin
+            if (!command_sent && nfc_cmd_ready) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_FIFOLEVEL;
+                nfc_cmd_wdata <= 8'h80; // FlushBuffer
+                command_sent <= 1'b1;
+            end else if (nfc_cmd_done) begin
+                command_sent <= 1'b0;
+            end
+        end
+        
+        ST_CONFIG_CRC: begin
+            if (!command_sent && nfc_cmd_ready) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_TXMODE;
+                // For SELECT, we need CRC. For others (REQA, ANTICOLL), we don't.
+                if (protocol_state == PROT_SELECT)
+                    nfc_cmd_wdata <= 8'h80; // TxCRCEn
+                else
+                    nfc_cmd_wdata <= 8'h00; // Disable CRC
+                command_sent <= 1'b1;
+            end else if (nfc_cmd_done) begin
+                command_sent <= 1'b0;
+            end
+        end
+
+        ST_CONFIG_RX_CRC: begin
+            if (!command_sent && nfc_cmd_ready) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_RXMODE;
+                // Symmetric to TxMode for our supported protocols
+                if (protocol_state == PROT_SELECT)
+                    nfc_cmd_wdata <= 8'h80; // RxCRCEn
+                else
+                    nfc_cmd_wdata <= 8'h00; // Disable CRC
+                command_sent <= 1'b1;
+            end else if (nfc_cmd_done) begin
+                command_sent <= 1'b0;
+            end
+        end
+        
         ST_TX_FIFO: begin
             // Setup Protocol Parameters (One-shot at start of state)
             if (tx_index == 0 && !command_sent) begin
@@ -301,7 +379,7 @@ module nfc_card_detector (
                         $display("[%0t] [NFC_DETECTOR] → ANTICOLL", $time);
                     end
                     PROT_SELECT: begin
-                        tx_length <= 9;
+                        tx_length <= 7; // 9 bytes total - 2 CRC = 7 bytes data
                         framing_bits <= 8'h80;
                         $display("[%0t] [NFC_DETECTOR] → SELECT", $time);
                     end
@@ -326,7 +404,7 @@ module nfc_card_detector (
                             4: nfc_cmd_wdata <= uid_buffer[15:8];
                             5: nfc_cmd_wdata <= uid_buffer[7:0];
                             6: nfc_cmd_wdata <= uid_buffer[31:24] ^ uid_buffer[23:16] ^ uid_buffer[15:8] ^ uid_buffer[7:0];
-                            default: nfc_cmd_wdata <= 8'h00; // CRC
+                            default: nfc_cmd_wdata <= 8'h00; // Should not happen with length 7
                         endcase
                     end
                     default: nfc_cmd_wdata <= 8'h00;
@@ -346,6 +424,8 @@ module nfc_card_detector (
                 nfc_cmd_addr <= REG_COMMAND;
                 nfc_cmd_wdata <= PCD_TRANSCEIVE;
                 command_sent <= 1'b1;
+            end else if (nfc_cmd_done) begin
+                command_sent <= 1'b0;
             end
         end
         
@@ -356,6 +436,8 @@ module nfc_card_detector (
                 nfc_cmd_addr <= REG_BITFRAMING;
                 nfc_cmd_wdata <= framing_bits;
                 command_sent <= 1'b1;
+            end else if (nfc_cmd_done) begin
+                command_sent <= 1'b0;
             end
         end
         
@@ -378,6 +460,7 @@ module nfc_card_detector (
                 command_sent <= 1'b1;
             end else if (nfc_cmd_done) begin
                 rx_count <= nfc_cmd_rdata[3:0]; // Assume max 16 bytes
+                command_sent <= 1'b0;
             end
         end
         
