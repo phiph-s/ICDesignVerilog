@@ -28,7 +28,7 @@ module mfrc522_interface #(
 
     // MFRC522 SPI Protocol:
     // Byte 0: Address byte
-    //   Bit 7: 0=read, 1=write
+    //   Bit 7: 1=read, 0=write
     //   Bit 6-1: Address (6 bits)
     //   Bit 0: Always 0
     // Byte 1: Data byte (write) or dummy+data (read)
@@ -114,7 +114,8 @@ module mfrc522_interface #(
                     spi_tx_count <= 2'd2;
                     
                     // Build and send address byte: [R/W][A5:A0][0]
-                    spi_tx_byte <= {current_is_write, current_addr, 1'b0};
+                    // Note: MFRC522 expects 1 for Read, 0 for Write
+                    spi_tx_byte <= {~current_is_write, current_addr, 1'b0};
                     spi_tx_dv <= 1;
                     bytes_sent <= 0;
                     state <= ST_SEND_DATA;

@@ -462,7 +462,7 @@ module mfrc522_model (
                         // Format: [R/W][A5:A0][0]
                         addr_byte <= complete_byte;
                         
-                        if (!complete_byte[7]) begin
+                        if (complete_byte[7]) begin
                             // Read operation - prepare data for next transfer
                             if (complete_byte[6:1] == REG_FIFODATA) begin
                                 if (fifo_level > 0)
