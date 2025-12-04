@@ -31,6 +31,17 @@ module nfc_card_detector (
   output logic [7:0]   error_code         // Error code for debugging
 );
 
+  // MFRC522 Registers
+  localparam [5:0] REG_COMMAND    = 6'h01;
+  localparam [5:0] REG_COMIRQ     = 6'h04;
+  localparam [5:0] REG_FIFODATA   = 6'h09;
+  localparam [5:0] REG_FIFOLEVEL  = 6'h0A;
+  localparam [5:0] REG_BITFRAMING = 6'h0D;
+  
+  // MFRC522 Commands
+  localparam [7:0] PCD_IDLE       = 8'h00;
+  localparam [7:0] PCD_TRANSCEIVE = 8'h0C;
+
   // ISO14443A Commands
   localparam [7:0] CMD_REQA     = 8'h26;  // Request Type A
   localparam [7:0] CMD_WUPA     = 8'h52;  // Wake-Up Type A
@@ -41,108 +52,167 @@ module nfc_card_detector (
   localparam [15:0] ATQA_MIFARE = 16'h0004;  // Typical ATQA response
   
   // State machine
-  typedef enum logic [3:0] {
+  typedef enum logic [4:0] {
     ST_IDLE,
     ST_WAIT_IRQ,
-    ST_SEND_REQA,
-    ST_WAIT_ATQA,
+    
+    // Generic Transaction States
+    ST_TX_FIFO,
+    ST_TX_CMD,
+    ST_TX_FRAMING,
+    ST_POLL_IRQ,
+    ST_READ_FIFO_LEVEL,
+    ST_READ_FIFO_DATA,
+    
+    // Protocol Decision States
     ST_CHECK_ATQA,
-    ST_SEND_ANTICOLL,
-    ST_WAIT_UID,
     ST_CHECK_UID,
-    ST_SEND_SELECT,
-    ST_WAIT_SAK,
     ST_CHECK_SAK,
+    
     ST_CARD_READY,
     ST_ERROR
   } state_t;
   
+  typedef enum logic [2:0] {
+    PROT_IDLE,
+    PROT_REQA,
+    PROT_ANTICOLL,
+    PROT_SELECT
+  } protocol_t;
+  
   state_t state, next_state;
+  protocol_t protocol_state, next_protocol_state;
   
   // Internal registers
   logic [31:0] uid_buffer;
   logic [15:0] atqa_response;
   logic [7:0]  sak_response;
-  logic [2:0]  uid_byte_count;
   logic [3:0]  retry_count;
-  logic        command_sent;  // Flag to ensure command is sent only once
+  logic        command_sent;
   logic        irq_detected;
+  
+  // Transaction buffers
+  logic [7:0]  tx_buffer [0:15];
+  logic [3:0]  tx_length;
+  logic [3:0]  tx_index;
+  logic [7:0]  rx_buffer [0:15];
+  logic [3:0]  rx_count;
+  logic [3:0]  rx_index;
+  logic [7:0]  framing_bits;
   
   // State machine - sequential logic
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       state <= ST_IDLE;
+      protocol_state <= PROT_IDLE;
     end else begin
       state <= next_state;
+      protocol_state <= next_protocol_state;
     end
   end
   
   // State machine - combinational logic
   always_comb begin
     next_state = state;
+    next_protocol_state = protocol_state;
     
     case (state)
       ST_IDLE: begin
-        if (irq_detected) next_state = ST_SEND_REQA;
+        if (irq_detected) begin
+            next_state = ST_TX_FIFO;
+            next_protocol_state = PROT_REQA;
+        end
       end
       
       ST_WAIT_IRQ: begin
-        if (irq_detected) next_state = ST_SEND_REQA;
+        if (irq_detected) begin
+            next_state = ST_TX_FIFO;
+            next_protocol_state = PROT_REQA;
+        end
       end
       
-      ST_SEND_REQA: begin
-        if (nfc_cmd_ready) next_state = ST_WAIT_ATQA;
+      // --- Generic Transaction Sequence ---
+      ST_TX_FIFO: begin
+        if (nfc_cmd_ready && !command_sent) begin
+            // Wait for write to complete
+        end else if (nfc_cmd_done) begin
+            if (tx_index < tx_length - 1)
+                next_state = ST_TX_FIFO; // Send next byte
+            else
+                next_state = ST_TX_CMD;
+        end
       end
       
-      ST_WAIT_ATQA: begin
-        if (nfc_cmd_done) next_state = ST_CHECK_ATQA;
+      ST_TX_CMD: begin
+        if (nfc_cmd_done) next_state = ST_TX_FRAMING;
       end
       
+      ST_TX_FRAMING: begin
+        if (nfc_cmd_done) next_state = ST_POLL_IRQ;
+      end
+      
+      ST_POLL_IRQ: begin
+        if (nfc_cmd_done) begin
+            // Check RxIRq bit (0x20)
+            if (nfc_cmd_rdata[5]) 
+                next_state = ST_READ_FIFO_LEVEL;
+            else
+                next_state = ST_POLL_IRQ; // Keep polling
+        end
+      end
+      
+      ST_READ_FIFO_LEVEL: begin
+        if (nfc_cmd_done) next_state = ST_READ_FIFO_DATA;
+      end
+      
+      ST_READ_FIFO_DATA: begin
+        if (nfc_cmd_done) begin
+            if (rx_index < rx_count - 1)
+                next_state = ST_READ_FIFO_DATA;
+            else begin
+                // Transaction complete, decide next based on protocol
+                case (protocol_state)
+                    PROT_REQA:     next_state = ST_CHECK_ATQA;
+                    PROT_ANTICOLL: next_state = ST_CHECK_UID;
+                    PROT_SELECT:   next_state = ST_CHECK_SAK;
+                    default:       next_state = ST_IDLE;
+                endcase
+            end
+        end
+      end
+      
+      // --- Protocol Logic ---
       ST_CHECK_ATQA: begin
-        if (atqa_response == ATQA_MIFARE)
-          next_state = ST_SEND_ANTICOLL;
-        else if (retry_count < 3)
-          next_state = ST_SEND_REQA;  // Retry
+        if (atqa_response == ATQA_MIFARE) begin
+          next_state = ST_TX_FIFO;
+          next_protocol_state = PROT_ANTICOLL;
+        end else if (retry_count < 3) begin
+          next_state = ST_TX_FIFO; // Retry REQA
+          next_protocol_state = PROT_REQA;
+        end else
+          next_state = ST_ERROR;
+      end
+      
+      ST_CHECK_UID: begin
+        next_state = ST_TX_FIFO;
+        next_protocol_state = PROT_SELECT;
+      end
+      
+      ST_CHECK_SAK: begin
+        if (sak_response[2] == 1'b0)
+          next_state = ST_CARD_READY;
         else
           next_state = ST_ERROR;
       end
       
-      ST_SEND_ANTICOLL: begin
-        if (nfc_cmd_ready) next_state = ST_WAIT_UID;
-      end
-      
-      ST_WAIT_UID: begin
-        if (nfc_cmd_done) next_state = ST_CHECK_UID;
-      end
-      
-      ST_CHECK_UID: begin
-        // Simple BCC check: XOR of all UID bytes should match BCC
-        next_state = ST_SEND_SELECT;
-      end
-      
-      ST_SEND_SELECT: begin
-        if (nfc_cmd_ready) next_state = ST_WAIT_SAK;
-      end
-      
-      ST_WAIT_SAK: begin
-        if (nfc_cmd_done) next_state = ST_CHECK_SAK;
-      end
-      
-      ST_CHECK_SAK: begin
-        // Check if SAK indicates complete (bit 3 = 0)
-        if (sak_response[2] == 1'b0)
-          next_state = ST_CARD_READY;
-        else
-          next_state = ST_ERROR;  // Cascade level required (not supported)
-      end
-      
       ST_CARD_READY: begin
-        // Go back to IDLE after one cycle (auth_controller takes over)
         next_state = ST_IDLE;
+        next_protocol_state = PROT_IDLE;
       end
       
       ST_ERROR: begin
-        next_state = ST_IDLE;  // Reset and wait for next attempt
+        next_state = ST_IDLE;
+        next_protocol_state = PROT_IDLE;
       end
     endcase
   end
@@ -155,14 +225,11 @@ module nfc_card_detector (
       irq_detected <= 1'b0;
     end else begin
       irq_prev <= nfc_irq;
-      // Rising edge detection
       if (nfc_irq && !irq_prev) begin
         irq_detected <= 1'b1;
         $display("[%0t] [NFC_DETECTOR] Card detected (IRQ triggered)", $time);
       end
-      // Clear detection flag only after state machine has processed it
-      // (after we've started the detection sequence)
-      if (state == ST_SEND_REQA && irq_detected) begin
+      if (state == ST_TX_FIFO && irq_detected) begin
         irq_detected <= 1'b0;
       end
     end
@@ -181,7 +248,6 @@ module nfc_card_detector (
       uid_buffer <= 32'h0;
       atqa_response <= 16'h0;
       sak_response <= 8'h0;
-      uid_byte_count <= 3'h0;
       retry_count <= 4'h0;
       command_sent <= 1'b0;
       
@@ -190,14 +256,23 @@ module nfc_card_detector (
       nfc_cmd_addr <= 6'h0;
       nfc_cmd_wdata <= 8'h0;
       
+      tx_length <= 0;
+      tx_index <= 0;
+      rx_count <= 0;
+      rx_index <= 0;
+      framing_bits <= 0;
+      
     end else begin
       // Default: clear single-cycle signals
       nfc_cmd_valid <= 1'b0;
       start_auth <= 1'b0;
       
-      // Clear command_sent flag when state changes
-      if (state != next_state)
+      if (state != next_state) begin
         command_sent <= 1'b0;
+        // Reset indices when entering new state
+        if (next_state == ST_TX_FIFO) tx_index <= 0;
+        if (next_state == ST_READ_FIFO_DATA) rx_index <= 0;
+      end
       
       case (state)
         ST_IDLE: begin
@@ -208,31 +283,129 @@ module nfc_card_detector (
           card_ready <= 1'b0;
           detection_error <= 1'b0;
           retry_count <= 4'h0;
-          // Don't clear irq_detected here - it's needed for state transition!
         end
         
-        ST_SEND_REQA: begin
-          if (!command_sent) begin
-            $display("[%0t] [NFC_DETECTOR] → REQA (Request Type A)", $time);
-            nfc_cmd_valid <= 1'b1;
-            nfc_cmd_write <= 1'b1;
-            nfc_cmd_addr <= 6'h09;  // TxModeReg
-            nfc_cmd_wdata <= CMD_REQA;
-            command_sent <= 1'b1;
-            // Reset response buffers for new detection
-            atqa_response <= 16'h0;
-            uid_buffer <= 32'h0;
-            sak_response <= 8'h0;
-          end
-          card_detected <= 1'b1;
+        // --- Generic Transaction Execution ---
+        ST_TX_FIFO: begin
+            // Setup Protocol Parameters (One-shot at start of state)
+            if (tx_index == 0 && !command_sent) begin
+                case (protocol_state)
+                    PROT_REQA: begin
+                        tx_length <= 1;
+                        framing_bits <= 8'h87; // 7 bits
+                        $display("[%0t] [NFC_DETECTOR] → REQA", $time);
+                    end
+                    PROT_ANTICOLL: begin
+                        tx_length <= 2;
+                        framing_bits <= 8'h80; // 8 bits
+                        $display("[%0t] [NFC_DETECTOR] → ANTICOLL", $time);
+                    end
+                    PROT_SELECT: begin
+                        tx_length <= 9;
+                        framing_bits <= 8'h80;
+                        $display("[%0t] [NFC_DETECTOR] → SELECT", $time);
+                    end
+                endcase
+            end
+
+            if (!command_sent && nfc_cmd_ready) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_FIFODATA;
+                
+                // Direct Data Mux (Avoids buffer latency)
+                case (protocol_state)
+                    PROT_REQA: nfc_cmd_wdata <= CMD_REQA;
+                    PROT_ANTICOLL: nfc_cmd_wdata <= (tx_index == 0) ? CMD_ANTICOLL : 8'h20;
+                    PROT_SELECT: begin
+                        case (tx_index)
+                            0: nfc_cmd_wdata <= CMD_SELECT;
+                            1: nfc_cmd_wdata <= 8'h70;
+                            2: nfc_cmd_wdata <= uid_buffer[31:24];
+                            3: nfc_cmd_wdata <= uid_buffer[23:16];
+                            4: nfc_cmd_wdata <= uid_buffer[15:8];
+                            5: nfc_cmd_wdata <= uid_buffer[7:0];
+                            6: nfc_cmd_wdata <= uid_buffer[31:24] ^ uid_buffer[23:16] ^ uid_buffer[15:8] ^ uid_buffer[7:0];
+                            default: nfc_cmd_wdata <= 8'h00; // CRC
+                        endcase
+                    end
+                    default: nfc_cmd_wdata <= 8'h00;
+                endcase
+                
+                command_sent <= 1'b1;
+            end else if (nfc_cmd_done) begin
+                command_sent <= 1'b0;
+                if (tx_index < tx_length - 1) tx_index <= tx_index + 1;
+            end
+            card_detected <= 1'b1;
         end
         
-        ST_WAIT_ATQA: begin
-          if (nfc_cmd_done) begin
-            atqa_response <= {atqa_response[7:0], nfc_cmd_rdata};
-          end
+        ST_TX_CMD: begin
+            if (!command_sent && nfc_cmd_ready) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_COMMAND;
+                nfc_cmd_wdata <= PCD_TRANSCEIVE;
+                command_sent <= 1'b1;
+            end
         end
         
+        ST_TX_FRAMING: begin
+            if (!command_sent && nfc_cmd_ready) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_BITFRAMING;
+                nfc_cmd_wdata <= framing_bits;
+                command_sent <= 1'b1;
+            end
+        end
+        
+        ST_POLL_IRQ: begin
+            if (!command_sent && nfc_cmd_ready) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0; // Read
+                nfc_cmd_addr <= REG_COMIRQ;
+                command_sent <= 1'b1;
+            end else if (nfc_cmd_done) begin
+                command_sent <= 1'b0; // Allow re-polling
+            end
+        end
+        
+        ST_READ_FIFO_LEVEL: begin
+            if (!command_sent && nfc_cmd_ready) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0;
+                nfc_cmd_addr <= REG_FIFOLEVEL;
+                command_sent <= 1'b1;
+            end else if (nfc_cmd_done) begin
+                rx_count <= nfc_cmd_rdata[3:0]; // Assume max 16 bytes
+            end
+        end
+        
+        ST_READ_FIFO_DATA: begin
+            if (!command_sent && nfc_cmd_ready) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0;
+                nfc_cmd_addr <= REG_FIFODATA;
+                command_sent <= 1'b1;
+            end else if (nfc_cmd_done) begin
+                command_sent <= 1'b0;
+                rx_buffer[rx_index] <= nfc_cmd_rdata;
+                if (rx_index < rx_count - 1) rx_index <= rx_index + 1;
+                
+                // Store data based on protocol
+                if (protocol_state == PROT_REQA) begin
+                    if (rx_index == 0) atqa_response[7:0] <= nfc_cmd_rdata;
+                    if (rx_index == 1) atqa_response[15:8] <= nfc_cmd_rdata;
+                end else if (protocol_state == PROT_ANTICOLL) begin
+                    if (rx_index < 4) uid_buffer[{rx_index[1:0], 3'b000} +: 8] <= nfc_cmd_rdata;
+                end else if (protocol_state == PROT_SELECT) begin
+                    if (rx_index == 0) sak_response <= nfc_cmd_rdata;
+                end
+            end
+        end
+        
+        // --- Protocol Checks ---
         ST_CHECK_ATQA: begin
           if (atqa_response == ATQA_MIFARE) begin
             $display("[%0t] [NFC_DETECTOR] ← ATQA: %h (valid)", $time, atqa_response);
@@ -243,43 +416,8 @@ module nfc_card_detector (
           end
         end
         
-        ST_SEND_ANTICOLL: begin
-          if (!command_sent) begin
-            $display("[%0t] [NFC_DETECTOR] → ANTICOLL (Anti-Collision)", $time);
-            nfc_cmd_valid <= 1'b1;
-            nfc_cmd_write <= 1'b1;
-            nfc_cmd_addr <= 6'h09;
-            nfc_cmd_wdata <= CMD_ANTICOLL;
-            command_sent <= 1'b1;
-          end
-        end
-        
-        ST_WAIT_UID: begin
-          if (nfc_cmd_done) begin
-            // In simplified version, assume UID is returned in single response
-            card_uid <= {24'h0, nfc_cmd_rdata};
-          end
-        end
-        
         ST_CHECK_UID: begin
-          $display("[%0t] [NFC_DETECTOR] ← UID: %h", $time, card_uid);
-        end
-        
-        ST_SEND_SELECT: begin
-          if (!command_sent) begin
-            $display("[%0t] [NFC_DETECTOR] → SELECT (Select Card)", $time);
-            nfc_cmd_valid <= 1'b1;
-            nfc_cmd_write <= 1'b1;
-            nfc_cmd_addr <= 6'h09;
-            nfc_cmd_wdata <= CMD_SELECT;
-            command_sent <= 1'b1;
-          end
-        end
-        
-        ST_WAIT_SAK: begin
-          if (nfc_cmd_done) begin
-            sak_response <= nfc_cmd_rdata;
-          end
+          $display("[%0t] [NFC_DETECTOR] ← UID: %h", $time, uid_buffer);
         end
         
         ST_CHECK_SAK: begin
@@ -289,14 +427,14 @@ module nfc_card_detector (
           end else begin
             $display("[%0t] [NFC_DETECTOR] ✗ Cascade required (not supported)", $time);
             detection_error <= 1'b1;
-            error_code <= 8'h01;  // Cascade not supported
+            error_code <= 8'h01;
           end
         end
         
         ST_CARD_READY: begin
           if (!card_ready) begin
             card_ready <= 1'b1;
-            start_auth <= 1'b1;  // Trigger authentication (one-shot)
+            start_auth <= 1'b1;
             $display("[%0t] [NFC_DETECTOR] Card ready → Starting authentication", $time);
           end
         end
@@ -304,7 +442,7 @@ module nfc_card_detector (
         ST_ERROR: begin
           detection_error <= 1'b1;
           if (error_code == 8'h00) begin
-            error_code <= 8'hFF;  // General error
+            error_code <= 8'hFF;
             $display("[%0t] [NFC_DETECTOR] ✗ Detection error", $time);
           end
         end

@@ -49,34 +49,60 @@ module auth_controller (
   input  logic         timeout_occurred
 );
 
+  // MFRC522 Registers
+  localparam [5:0] REG_COMMAND    = 6'h01;
+  localparam [5:0] REG_COMIRQ     = 6'h04;
+  localparam [5:0] REG_FIFODATA   = 6'h09;
+  localparam [5:0] REG_FIFOLEVEL  = 6'h0A;
+  localparam [5:0] REG_BITFRAMING = 6'h0D;
+  localparam [7:0] PCD_TRANSCEIVE = 8'h0C;
+
   // Protocol command codes (CLA INS)
   localparam [15:0] CMD_AUTH_INIT = 16'h8010;
   localparam [15:0] CMD_AUTH      = 16'h8011;
   localparam [15:0] CMD_GET_ID    = 16'h8012;
   
   // State machine
-  typedef enum logic [4:0] {
+  typedef enum logic [5:0] {
     ST_IDLE,
     ST_LOAD_KEY_START,
     ST_LOAD_KEY_WAIT,
     ST_LOAD_KEY_BYTES,
-    ST_AUTH_INIT_SEND,
-    ST_AUTH_INIT_WAIT,
-    ST_AUTH_INIT_READ,
-    ST_AUTH_INIT_READ_WAIT,
+    
+    // AUTH_INIT Sequence
+    ST_AUTH_INIT_FIFO,
+    ST_AUTH_INIT_CMD,
+    ST_AUTH_INIT_FRAMING,
+    ST_AUTH_INIT_IRQ,
+    ST_AUTH_INIT_READ_LEN,
+    ST_AUTH_INIT_READ_DATA,
+    
     ST_DECRYPT_RC,
     ST_DECRYPT_RC_WAIT,
     ST_GEN_NONCE,
     ST_GEN_NONCE_WAIT,
     ST_ENCRYPT_AUTH,
     ST_ENCRYPT_AUTH_WAIT,
-    ST_AUTH_SEND,
-    ST_AUTH_WAIT,
+    
+    // AUTH Sequence
+    ST_AUTH_FIFO,
+    ST_AUTH_CMD,
+    ST_AUTH_FRAMING,
+    ST_AUTH_IRQ,
+    ST_AUTH_READ_LEN,
+    ST_AUTH_READ_DATA,
+    
     ST_DERIVE_SESSION_KEY,
     ST_DERIVE_SESSION_KEY_WAIT,
-    ST_GET_ID_SEND,
-    ST_GET_ID_WAIT,
-    ST_GET_ID_READ,
+    
+    // GET_ID Sequence
+    ST_GET_ID_FIFO,
+    ST_GET_ID_CMD,
+    ST_GET_ID_FRAMING,
+    ST_GET_ID_IRQ,
+    ST_GET_ID_READ_LEN,
+    ST_GET_ID_READ_DATA,
+    
     ST_DECRYPT_ID,
     ST_DECRYPT_ID_WAIT,
     ST_SUCCESS,
@@ -127,7 +153,7 @@ module auth_controller (
       ST_LOAD_KEY_WAIT: begin
         if (key_data_valid) begin
           if (key_byte_counter == 15)
-            next_state = ST_AUTH_INIT_SEND;
+            next_state = ST_AUTH_INIT_FIFO;
           else
             next_state = ST_LOAD_KEY_BYTES;
         end
@@ -136,30 +162,47 @@ module auth_controller (
       ST_LOAD_KEY_BYTES: begin
         if (key_data_valid) begin
           if (key_byte_counter == 15)
-            next_state = ST_AUTH_INIT_SEND;
+            next_state = ST_AUTH_INIT_FIFO;
           else
             next_state = ST_LOAD_KEY_WAIT;
         end
       end
       
-      ST_AUTH_INIT_SEND: begin
-        if (nfc_cmd_ready) next_state = ST_AUTH_INIT_WAIT;
+      // --- AUTH_INIT Transaction ---
+      ST_AUTH_INIT_FIFO: begin
+        if (nfc_cmd_ready && !nfc_cmd_valid) begin
+            // Wait for write
+        end else if (nfc_cmd_done) begin
+            if (fifo_byte_counter == 0) // Sent 0x80, now send 0x10
+                next_state = ST_AUTH_INIT_FIFO;
+            else
+                next_state = ST_AUTH_INIT_CMD;
+        end
       end
       
-      ST_AUTH_INIT_WAIT: begin
-        if (nfc_cmd_done) next_state = ST_AUTH_INIT_READ;
+      ST_AUTH_INIT_CMD: begin
+        if (nfc_cmd_done) next_state = ST_AUTH_INIT_FRAMING;
       end
       
-      ST_AUTH_INIT_READ: begin
-        if (nfc_cmd_ready) next_state = ST_AUTH_INIT_READ_WAIT;
+      ST_AUTH_INIT_FRAMING: begin
+        if (nfc_cmd_done) next_state = ST_AUTH_INIT_IRQ;
       end
       
-      ST_AUTH_INIT_READ_WAIT: begin
+      ST_AUTH_INIT_IRQ: begin
+        if (nfc_cmd_done && nfc_cmd_rdata[5]) // RxIRq
+            next_state = ST_AUTH_INIT_READ_LEN;
+      end
+      
+      ST_AUTH_INIT_READ_LEN: begin
+        if (nfc_cmd_done) next_state = ST_AUTH_INIT_READ_DATA;
+      end
+      
+      ST_AUTH_INIT_READ_DATA: begin
         if (nfc_cmd_done) begin
-          if (fifo_byte_counter >= 15)  // After 16 bytes (0-15)
+          if (fifo_byte_counter >= 15)  // Read 16 bytes
             next_state = ST_DECRYPT_RC;
           else
-            next_state = ST_AUTH_INIT_READ;
+            next_state = ST_AUTH_INIT_READ_DATA;
         end
       end
       
@@ -191,20 +234,51 @@ module auth_controller (
       end
       
       ST_ENCRYPT_AUTH_WAIT: begin
-        if (aes_done) next_state = ST_AUTH_SEND;
+        if (aes_done) begin
+            encrypted_rc <= aes_block_out; // Reuse encrypted_rc to store auth token
+            fifo_byte_counter <= 0;
+            next_state = ST_AUTH_FIFO;
+        end
       end
       
-      ST_AUTH_SEND: begin
-        if (nfc_cmd_ready) next_state = ST_AUTH_WAIT;
+      // --- AUTH Transaction ---
+      ST_AUTH_FIFO: begin
+        if (nfc_cmd_ready && !nfc_cmd_valid) begin
+            // Wait for write
+        end else if (nfc_cmd_done) begin
+            if (fifo_byte_counter >= 17) // 0x80, 0x11, + 16 bytes
+                next_state = ST_AUTH_CMD;
+            else
+                next_state = ST_AUTH_FIFO;
+        end
       end
       
-      ST_AUTH_WAIT: begin
-        // Check card's response - 0xFF indicates auth failure
+      ST_AUTH_CMD: begin
+        if (nfc_cmd_done) next_state = ST_AUTH_FRAMING;
+      end
+      
+      ST_AUTH_FRAMING: begin
+        if (nfc_cmd_done) next_state = ST_AUTH_IRQ;
+      end
+      
+      ST_AUTH_IRQ: begin
+        if (nfc_cmd_done && nfc_cmd_rdata[5]) // RxIRq
+            next_state = ST_AUTH_READ_LEN;
+      end
+      
+      ST_AUTH_READ_LEN: begin
+        if (nfc_cmd_done) next_state = ST_AUTH_READ_DATA;
+      end
+      
+      ST_AUTH_READ_DATA: begin
         if (nfc_cmd_done) begin
-          if (nfc_cmd_rdata == 8'hFF)
-            next_state = ST_FAILED;
-          else
-            next_state = ST_DERIVE_SESSION_KEY;
+            // Check status byte (should be 0x00 or 0x90)
+            // For now, assume any response is good, but we should check.
+            // The model returns status.
+            if (nfc_cmd_rdata == 8'hFF)
+                next_state = ST_FAILED;
+            else
+                next_state = ST_DERIVE_SESSION_KEY;
         end
       end
       
@@ -213,23 +287,49 @@ module auth_controller (
       end
       
       ST_DERIVE_SESSION_KEY_WAIT: begin
-        if (aes_done) next_state = ST_GET_ID_SEND;
+        if (aes_done) begin
+            session_key <= aes_block_out;
+            fifo_byte_counter <= 0;
+            next_state = ST_GET_ID_FIFO;
+        end
       end
       
-      ST_GET_ID_SEND: begin
-        if (nfc_cmd_ready) next_state = ST_GET_ID_WAIT;
-      end
-      
-        ST_GET_ID_WAIT: begin
-          // Check if card responds with error (card not authenticated)
-          if (nfc_cmd_done) begin
-            if (nfc_cmd_rdata == 8'hFF)
-              next_state = ST_FAILED;
+      // --- GET_ID Transaction ---
+      ST_GET_ID_FIFO: begin
+        if (nfc_cmd_ready && !nfc_cmd_valid) begin
+            // Wait
+        end else if (nfc_cmd_done) begin
+            if (fifo_byte_counter >= 1) // 0x80, 0x12
+                next_state = ST_GET_ID_CMD;
             else
-              next_state = ST_GET_ID_READ;
-          end
-        end      ST_GET_ID_READ: begin
-        if (fifo_byte_counter == 16) next_state = ST_DECRYPT_ID;
+                next_state = ST_GET_ID_FIFO;
+        end
+      end
+      
+      ST_GET_ID_CMD: begin
+        if (nfc_cmd_done) next_state = ST_GET_ID_FRAMING;
+      end
+      
+      ST_GET_ID_FRAMING: begin
+        if (nfc_cmd_done) next_state = ST_GET_ID_IRQ;
+      end
+      
+      ST_GET_ID_IRQ: begin
+        if (nfc_cmd_done && nfc_cmd_rdata[5]) // RxIRq
+            next_state = ST_GET_ID_READ_LEN;
+      end
+      
+      ST_GET_ID_READ_LEN: begin
+        if (nfc_cmd_done) next_state = ST_GET_ID_READ_DATA;
+      end
+      
+      ST_GET_ID_READ_DATA: begin
+        if (nfc_cmd_done) begin
+          if (fifo_byte_counter >= 15)  // Read 16 bytes
+            next_state = ST_DECRYPT_ID;
+          else
+            next_state = ST_GET_ID_READ_DATA;
+        end
       end
       
       ST_DECRYPT_ID: begin
@@ -335,34 +435,68 @@ module auth_controller (
               key_addr <= KEY_BASE_ADDR + key_byte_counter + 1;
             end else begin
               $display("[%0t] [CHIP] PSK loaded: %h", $time, {psk[119:0], key_data});
+              fifo_byte_counter <= 0; // Reset for next state
             end
           end
         end
         
-        ST_AUTH_INIT_SEND: begin
-          // Send AUTH_INIT command (0x80 0x10) to card via NFC
-          // This is simplified - actual implementation needs APDU framing
-          $display("[%0t] [CHIP] → AUTH_INIT", $time);
-          nfc_cmd_valid <= 1'b1;
-          nfc_cmd_write <= 1'b1;
-          nfc_cmd_wdata <= 8'h80;  // CLA
-          fifo_byte_counter <= 8'h0;
+        // --- AUTH_INIT Implementation ---
+        ST_AUTH_INIT_FIFO: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_FIFODATA;
+                nfc_cmd_wdata <= (fifo_byte_counter == 0) ? 8'h80 : 8'h10;
+                if (fifo_byte_counter == 0) $display("[%0t] [CHIP] → AUTH_INIT (80 10)", $time);
+            end else if (nfc_cmd_done) begin
+                fifo_byte_counter <= fifo_byte_counter + 1;
+            end
         end
         
-        ST_AUTH_INIT_READ: begin
-          // Request to read one byte from NFC (simulated FIFO read)
-          nfc_cmd_valid <= 1'b1;
-          nfc_cmd_write <= 1'b0;  // Read
-          nfc_cmd_wdata <= 8'h00;  // Dummy data
+        ST_AUTH_INIT_CMD: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_COMMAND;
+                nfc_cmd_wdata <= PCD_TRANSCEIVE;
+            end
         end
         
-        ST_AUTH_INIT_READ_WAIT: begin
-          // Wait for read to complete and store byte
-          if (nfc_cmd_done) begin
-            // Bytes come from NFC, shift left with new byte to LSB
-            encrypted_rc <= {encrypted_rc[119:0], nfc_cmd_rdata};
-            fifo_byte_counter <= fifo_byte_counter + 1;
-          end
+        ST_AUTH_INIT_FRAMING: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_BITFRAMING;
+                nfc_cmd_wdata <= 8'h80; // StartSend
+            end
+        end
+        
+        ST_AUTH_INIT_IRQ: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0; // Read
+                nfc_cmd_addr <= REG_COMIRQ;
+            end
+        end
+        
+        ST_AUTH_INIT_READ_LEN: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0;
+                nfc_cmd_addr <= REG_FIFOLEVEL;
+                fifo_byte_counter <= 0; // Reset for data read
+            end
+        end
+        
+        ST_AUTH_INIT_READ_DATA: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0;
+                nfc_cmd_addr <= REG_FIFODATA;
+            end else if (nfc_cmd_done) begin
+                encrypted_rc <= {encrypted_rc[119:0], nfc_cmd_rdata};
+                fifo_byte_counter <= fifo_byte_counter + 1;
+            end
         end
         
         ST_DECRYPT_RC: begin
@@ -404,11 +538,66 @@ module auth_controller (
           aes_block_in <= {rt, rc};
         end
         
-        ST_AUTH_SEND: begin
-          // Send AUTH command with encrypted response
-          nfc_cmd_valid <= 1'b1;
-          nfc_cmd_write <= 1'b1;
-          nfc_cmd_wdata <= 8'h80;  // CLA (simplified)
+        // --- AUTH Implementation ---
+        ST_AUTH_FIFO: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_FIFODATA;
+                if (fifo_byte_counter == 0)
+                    nfc_cmd_wdata <= 8'h80;
+                else if (fifo_byte_counter == 1)
+                    nfc_cmd_wdata <= 8'h11;
+                else
+                    nfc_cmd_wdata <= encrypted_rc[127:120]; // Send MSB
+            end else if (nfc_cmd_done) begin
+                fifo_byte_counter <= fifo_byte_counter + 1;
+                if (fifo_byte_counter >= 2)
+                    encrypted_rc <= {encrypted_rc[119:0], 8'h00}; // Shift
+            end
+        end
+        
+        ST_AUTH_CMD: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_COMMAND;
+                nfc_cmd_wdata <= PCD_TRANSCEIVE;
+            end
+        end
+        
+        ST_AUTH_FRAMING: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_BITFRAMING;
+                nfc_cmd_wdata <= 8'h80;
+            end
+        end
+        
+        ST_AUTH_IRQ: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0;
+                nfc_cmd_addr <= REG_COMIRQ;
+            end
+        end
+        
+        ST_AUTH_READ_LEN: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0;
+                nfc_cmd_addr <= REG_FIFOLEVEL;
+                fifo_byte_counter <= 0;
+            end
+        end
+        
+        ST_AUTH_READ_DATA: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0;
+                nfc_cmd_addr <= REG_FIFODATA;
+            end
         end
         
         ST_DERIVE_SESSION_KEY: begin
@@ -426,21 +615,62 @@ module auth_controller (
           end
         end
         
-        ST_GET_ID_SEND: begin
-          // Send GET_ID command
-          $display("[%0t] [CHIP] → GET_ID", $time);
-          nfc_cmd_valid <= 1'b1;
-          nfc_cmd_write <= 1'b1;
-          nfc_cmd_wdata <= 8'h80;  // CLA (simplified)
-          fifo_byte_counter <= 8'h0;
+        // --- GET_ID Implementation ---
+        ST_GET_ID_FIFO: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_FIFODATA;
+                nfc_cmd_wdata <= (fifo_byte_counter == 0) ? 8'h80 : 8'h12;
+            end else if (nfc_cmd_done) begin
+                fifo_byte_counter <= fifo_byte_counter + 1;
+            end
         end
         
-        ST_GET_ID_READ: begin
-          // Read 16 bytes of encrypted card ID
-          // In a real implementation, this would read from NFC FIFO
-          // For now, we simulate receiving all 16 bytes at once
-          encrypted_id <= {encrypted_id[119:0], nfc_cmd_rdata};
-          fifo_byte_counter <= fifo_byte_counter + 1;
+        ST_GET_ID_CMD: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_COMMAND;
+                nfc_cmd_wdata <= PCD_TRANSCEIVE;
+            end
+        end
+        
+        ST_GET_ID_FRAMING: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b1;
+                nfc_cmd_addr <= REG_BITFRAMING;
+                nfc_cmd_wdata <= 8'h80;
+            end
+        end
+        
+        ST_GET_ID_IRQ: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0;
+                nfc_cmd_addr <= REG_COMIRQ;
+            end
+        end
+        
+        ST_GET_ID_READ_LEN: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0;
+                nfc_cmd_addr <= REG_FIFOLEVEL;
+                fifo_byte_counter <= 0;
+            end
+        end
+        
+        ST_GET_ID_READ_DATA: begin
+            if (nfc_cmd_ready && !nfc_cmd_valid) begin
+                nfc_cmd_valid <= 1'b1;
+                nfc_cmd_write <= 1'b0;
+                nfc_cmd_addr <= REG_FIFODATA;
+            end else if (nfc_cmd_done) begin
+                encrypted_id <= {encrypted_id[119:0], nfc_cmd_rdata};
+                fifo_byte_counter <= fifo_byte_counter + 1;
+            end
         end
         
         ST_DECRYPT_ID: begin

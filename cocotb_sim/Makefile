@@ -15,4 +15,8 @@ at25010:
 mfrc522:
 	$(MAKE) sim MODULE=test_mfrc522 TOPLEVEL=mfrc522_interface VERILOG_SOURCES="$(PWD)/../rtl/mfrc522_interface.v $(SPI_MASTER_SRC)"
 
+# Main Core Test
+main_core:
+	$(MAKE) sim MODULE=test_main_core TOPLEVEL=main_core VERILOG_SOURCES="$(PWD)/../rtl/main_core.v $(PWD)/../rtl/nfc_card_detector.v $(PWD)/../rtl/auth_controller.v $(PWD)/../rtl/aes_core.v $(PWD)/../rtl/nonce_generator.v $(PWD)/../rtl/at25010_interface.v $(PWD)/../rtl/mfrc522_interface.v $(PWD)/../ip/aes-verilog/*.v $(SPI_MASTER_SRC)"
+
 include $(shell cocotb-config --makefiles)/Makefile.sim
